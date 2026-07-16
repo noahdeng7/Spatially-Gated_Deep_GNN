@@ -1,9 +1,7 @@
 import sys
 import numpy as np
 import polars as pl
-from scipy.stats import randint
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import RandomizedSearchCV, KFold
 from sklearn.metrics import mean_squared_error, r2_score
 import joblib
 
@@ -11,6 +9,7 @@ sys.stdout = open("random_forest/final_run.txt", "w", buffering=1)
 sys.stderr = sys.stdout
 
 NEG_SAMPLE_RATE = 0.3
+MTRY_FRACTION = 1.0 / 3.0
 rng = np.random.default_rng(42)
 
 
@@ -55,6 +54,18 @@ def load_xy(x_path, y_path, non_numeric_cols=None):
     return X, y, x_df.columns, non_numeric_cols
 
 
+def add_negatives(X, y, rate, rng):
+    n_neg = int(len(y) * rate)
+    idx = rng.choice(len(X), size=n_neg, replace=True)
+    X_full = np.vstack([X, X[idx]])
+    y_full = np.concatenate([y, np.zeros(n_neg, dtype=np.float32)])
+    return X_full, y_full, n_neg
+
+
+def oob_mse(model, y_true):
+    return mean_squared_error(y_true, model.oob_prediction_)
+
+
 X_train, y_train, train_cols, non_numeric_cols = load_xy(
     "data/X_train.csv", "data/y_train_log1p.csv"
 )
@@ -65,48 +76,72 @@ X_inference, y_inference, _, _ = load_xy(
     "data/X_inference.csv", "data/y_inference_log1p.csv", non_numeric_cols
 )
 
-def add_negatives(X, y, rate, rng):
-    n_neg = int(len(y) * rate)
-    idx = rng.choice(len(X), size=n_neg, replace=True)
-    X_full = np.vstack([X, X[idx]])
-    y_full = np.concatenate([y, np.zeros(n_neg, dtype=np.float32)])
-    return X_full, y_full, n_neg
-
 X_train, y_train, n_neg_train = add_negatives(X_train, y_train, NEG_SAMPLE_RATE, rng)
 X_test, y_test, n_neg_test = add_negatives(X_test, y_test, NEG_SAMPLE_RATE, rng)
 
 print(f"neg_sample_rate={NEG_SAMPLE_RATE}  n_neg_train={n_neg_train}  n_neg_test={n_neg_test}")
 print(f"train shape={X_train.shape}  test shape={X_test.shape}  inference shape={X_inference.shape}")
 
-param_distributions = {
-    "n_estimators":      randint(100, 800),
-    "max_depth":         [10, 20, 40, 80, None],
-    "min_samples_split": randint(2, 11),
-    "min_samples_leaf":  randint(1, 6),
-    "max_features":      ["sqrt", "log2", 0.3, 0.5, None],
+leaf_candidates = [5, 10, 20, 50, 100]
+leaf_scores = {}
+for leaf in leaf_candidates:
+    rf = RandomForestRegressor(
+        n_estimators=100,
+        min_samples_leaf=leaf,
+        max_features=MTRY_FRACTION,
+        criterion="squared_error",
+        bootstrap=True,
+        oob_score=True,
+        random_state=42,
+        n_jobs=-1,
+    )
+    rf.fit(X_train, y_train)
+    leaf_scores[leaf] = oob_mse(rf, y_train)
+    print(f"leaf_size={leaf:4d}  OOB MSE={leaf_scores[leaf]:.6f}")
+
+best_leaf = min(leaf_scores, key=leaf_scores.get)
+print(f"Best leaf size: {best_leaf} (OOB MSE {leaf_scores[best_leaf]:.6f})")
+
+tree_candidates = [20, 50, 100, 200]
+tree_scores = {}
+for n_trees in tree_candidates:
+    rf = RandomForestRegressor(
+        n_estimators=n_trees,
+        min_samples_leaf=best_leaf,
+        max_features=MTRY_FRACTION,
+        criterion="squared_error",
+        bootstrap=True,
+        oob_score=True,
+        random_state=42,
+        n_jobs=-1,
+    )
+    rf.fit(X_train, y_train)
+    tree_scores[n_trees] = oob_mse(rf, y_train)
+    print(f"n_trees={n_trees:4d}  OOB MSE={tree_scores[n_trees]:.6f}")
+
+best_n_trees = min(tree_scores, key=tree_scores.get)
+print(f"Best n_trees: {best_n_trees} (OOB MSE {tree_scores[best_n_trees]:.6f})")
+
+best_params = {
+    "min_samples_leaf": best_leaf,
+    "n_estimators": best_n_trees,
+    "max_features": MTRY_FRACTION,
 }
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
-rf = RandomForestRegressor(
-    criterion="squared_error",
-    random_state=42,
-    n_jobs=-1,
-)
-search = RandomizedSearchCV(
-    estimator=rf,
-    param_distributions=param_distributions,
-    n_iter=20,
-    cv=kf,
-    scoring="neg_mean_absolute_error",
-    random_state=42,
-    n_jobs=-1,
-    verbose=2,
-)
-search.fit(X_train, y_train)
-best_rf     = search.best_estimator_
-best_params = search.best_params_
-best_mae    = -search.best_score_
 print(f"Best params: {best_params}")
-print(f"Best CV MAE (log1p): {best_mae:.6f}")
+
+best_rf = RandomForestRegressor(
+    n_estimators=best_n_trees,
+    min_samples_leaf=best_leaf,
+    max_features=MTRY_FRACTION,
+    criterion="squared_error",
+    bootstrap=True,
+    oob_score=True,
+    random_state=42,
+    n_jobs=-1,
+)
+best_rf.fit(X_train, y_train)
+best_oob_mse = oob_mse(best_rf, y_train)
+print(f"Best model OOB MSE: {best_oob_mse:.6f}")
 
 preds_test_log = best_rf.predict(X_test)
 preds_inference_log = best_rf.predict(X_inference)
@@ -123,7 +158,9 @@ joblib.dump(
     {
         "model": best_rf,
         "best_params": best_params,
-        "best_cv_mae_log1p": best_mae,
+        "best_oob_mse": best_oob_mse,
+        "leaf_scores": leaf_scores,
+        "tree_scores": tree_scores,
         "neg_sample_rate": NEG_SAMPLE_RATE,
         "test_metrics": test_metrics,
         "inference_metrics": inference_metrics,
