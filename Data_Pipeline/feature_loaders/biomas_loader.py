@@ -30,11 +30,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from utils import RAW, normalize_code
+from utils import RAW, normalize_code, INTERMEDIATE
 
 MAPBIOMAS_DIR = RAW / "mapbiomas"
 COVERAGE_FILE = MAPBIOMAS_DIR / "MAPBIOMAS_BRAZIL-COVERAGE_STATISTICS-COL.10.1-MUNICIPALITIES_STATES_BIOMES.xlsx"
-CACHE = Path(__file__).resolve().parent.parent / "data_cache"
+CACHE = INTERMEDIATE   # data/intermediate — shared with the pipeline's checkpoints
 
 CLASS_PASTURE    = 15
 CLASS_URBAN      = 24
@@ -232,7 +232,7 @@ def fire_pct_per_muni(years: list[int] | int | None = None) -> pd.DataFrame:
     Hotspot counts come from INPE BDQueimadas focos (MODIS Aqua reference
     satellite), averaged across `years` (default 2006-2010) — one focos zip is
     downloaded per year. Joined to munis by (estado, municipio) name → IBGE
-    7-digit code via the 2010 shapefile. Result cached to data_cache/.
+    7-digit code via the 2010 shapefile. Result cached to data/intermediate/.
     """
     years = _as_year_list(years)
     cache = CACHE / f"biomas_fire_{_cache_key(years)}.parquet"

@@ -14,15 +14,13 @@ Codes were verified against the live SIDRA metadata endpoint
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import requests
 import pandas as pd
 
-from utils import normalize_code, load_areas, MUNI_GPKG
+from utils import normalize_code, load_areas, MUNI_GPKG, INTERMEDIATE
 
 SIDRA = "https://servicodados.ibge.gov.br/api/v3/agregados"
-CACHE = Path(__file__).resolve().parent.parent / "data_cache"
+CACHE = INTERMEDIATE   # data/intermediate — shared with the pipeline's checkpoints
 
 # Variable holding "planted-equivalent" area, by table:
 #   1612 (temporárias) → 109 (Área plantada)

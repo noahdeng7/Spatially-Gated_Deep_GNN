@@ -21,11 +21,11 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from utils import RAW, normalize_code
+from utils import RAW, normalize_code, INTERMEDIATE
 
 HDX_API = "https://data.humdata.org/api/3/action/package_show?id="
 HOTOSM_DIR = RAW / "hotosm"
-CACHE = Path(__file__).resolve().parent.parent / "data_cache"
+CACHE = INTERMEDIATE   # data/intermediate — shared with the pipeline's checkpoints
 
 LAYERS = [
     ("hotosm_bra_roads",      "road_density"),
@@ -160,10 +160,10 @@ def _line_density(file_path: Path, gdf_munis) -> pd.Series:
 
 
 def all_densities() -> pd.DataFrame:
-    """Per-muni road_density, railway_density (m per km²), cached to data_cache/.
+    """Per-muni road_density, railway_density (m per km²), cached to data/intermediate/.
 
     The road layer is ~7.4M LineStrings and its clip/overlay dominates runtime,
-    so the computed result is cached. Delete data_cache/transport_density.parquet
+    so the computed result is cached. Delete data/intermediate/transport_density.parquet
     to force a refresh against the current HOTOSM snapshot.
     """
     cache = CACHE / "transport_density.parquet"

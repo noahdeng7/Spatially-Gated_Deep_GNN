@@ -18,7 +18,7 @@ hourly→daily server-side.
 
 AUTH
 ----
-Needs Earth Engine — the same auth NDVI uses (`_init_ee` from features_ndvi).
+Needs Earth Engine — the same auth NDVI uses (`_init_ee` from ndvi_loader).
 In the container the mounted ~/.config/earthengine + ~/.config/gcloud provide it.
 
 VARIABLES PRODUCED (this is the whole surface; everything else was trimmed)

@@ -15,10 +15,12 @@ import pyarrow.dataset as ds
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-HERE = Path(__file__).resolve().parent
-RAW = HERE / "raw_data"
-INTERMEDIATE = HERE / "intermediate"
-FINAL = HERE / "final_data"
+HERE = Path(__file__).resolve().parent   # helpers/
+ROOT = HERE.parent                       # Data_Pipeline/ (the main pipeline folder)
+DATA = ROOT / "data"
+RAW = DATA / "raw"
+INTERMEDIATE = DATA / "intermediate"
+FINAL = DATA / "final"
 
 # Pinned to 2010 IBGE municipal boundaries (5,565 munis) — the dataset is for
 # 2010, so all per-muni grouping, area computations, and zonal stats use 2010
