@@ -1,7 +1,7 @@
 import sys
 import numpy as np
 import polars as pl
-from scipy.stats import randint, uniform
+from scipy.stats import randint
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import RandomizedSearchCV, KFold
 from sklearn.metrics import mean_squared_error, r2_score
