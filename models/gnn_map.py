@@ -1,42 +1,74 @@
 import argparse
 import os
-
-import geobr
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from torch_geometric.nn import GCNConv, GATConv
+from torch.nn.parallel import replicate, parallel_apply
 from libpysal.weights import KNN
-from matplotlib.colors import LogNorm
-from matplotlib.patches import FancyArrowPatch
 from sklearn.preprocessing import StandardScaler
-from torch_geometric.nn import GATConv, GCNConv
+from scipy.stats import spearmanr
+
+import geobr
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--name", type=str, required=True, help="run name of checkpoint")
+parser.add_argument("--name", type=str, required=True)
 parser.add_argument("--gpu", action="store_true", default=False)
+parser.add_argument("--n_perm", type=int, default=999)
+parser.add_argument("--top_edges", type=int, default=3000)
 args = parser.parse_args()
 
-device = torch.device("cuda" if args.gpu and torch.cuda.is_available() else "cpu")
+torch.manual_seed(42)
+np.random.seed(42)
+rng = np.random.default_rng(42)
+
+os.makedirs("the_gnn", exist_ok=True)
+FIG_DIR = f"the_gnn/figs_{args.name}"
+os.makedirs(FIG_DIR, exist_ok=True)
+
+log_file = open(f"the_gnn/info_{args.name}.txt", "w")
+def log(msg):
+    print(msg)
+    log_file.write(msg + "\n")
+    log_file.flush()
+
+plt.rcParams.update({
+    "font.size": 19,
+    "axes.titlesize": 19,
+    "axes.labelsize": 19,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.fontsize": 16,
+    "figure.titlesize": 19,
+    "font.family": "serif",
+})
+
+def savefig(fig, name):
+    fig.tight_layout()
+    fig.savefig(f"{FIG_DIR}/{name}.png", dpi=300, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
 
 DROP_NODE_FEATURES = []
 DROP_EDGE_FEATURES = []
 
-os.makedirs("the_gnn/maps", exist_ok=True)
-
-X_train = pl.read_csv("data/X_train.csv")
-X_test = pl.read_csv("data/X_test.csv")
+X_train     = pl.read_csv("data/X_train.csv")
+X_test      = pl.read_csv("data/X_test.csv")
 X_inference = pl.read_csv("data/X_inference.csv")
+Y_train     = pl.read_csv("data/y_train.csv")
+Y_test      = pl.read_csv("data/y_test.csv")
+Y_inference = pl.read_csv("data/y_inference.csv")
+
+y_col = "flow" if "flow" in Y_train.columns else Y_train.columns[0]
 
 id_cols = ["source_code", "dest_code"]
-dyadic_cols = [
-    c for c in X_train.columns
-    if c not in id_cols and not c.startswith("src_") and not c.startswith("dst_")
-    and c not in DROP_EDGE_FEATURES
-]
-
+dyadic_cols = [c for c in X_train.columns
+               if c not in id_cols and not c.startswith("src_") and not c.startswith("dst_")
+               and c not in DROP_EDGE_FEATURES]
 
 def build_node_frame(df, prefix):
     id_col = "source_code" if prefix == "src_" else "dest_code"
@@ -47,7 +79,6 @@ def build_node_frame(df, prefix):
         .rename({id_col: "city_code", **renamed})
         .unique(subset="city_code", keep="first")
     )
-
 
 all_nodes = (
     pl.concat([
@@ -65,23 +96,27 @@ all_nodes = all_nodes.select(["city_code"] + feat_cols)
 col_means = all_nodes.select(feat_cols).mean()
 all_nodes = all_nodes.with_columns([pl.col(c).fill_null(col_means[c][0]) for c in feat_cols])
 
-city_codes = all_nodes["city_code"].to_list()
-city_to_idx = {code: i for i, code in enumerate(city_codes)}
-num_nodes = len(city_codes)
+city_codes  = all_nodes["city_code"].to_list()
+num_nodes   = len(city_codes)
+city_map_df = pl.DataFrame({"city_code": city_codes, "node_idx": list(range(num_nodes))})
 
-income_keywords = ["gdp"]
-income_idx = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in income_keywords)]
-climate_keywords = ["_temp", "precipitation", "ndvi", "uv_", "humid", "wind_mean", "wet_bulb", "degree_day"]
+income_keywords  = ["income"]
+climate_keywords = ["_temp", "_precip", "ndvi", "uv", "wind_mean", "wet_bulb", "degree_day"]
+income_idx  = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in income_keywords)]
 climate_idx = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in climate_keywords)]
-climate_names = [feat_cols[i] for i in climate_idx]
-gravity_edge_idx = [i for i, c in enumerate(dyadic_cols) if c in ("pop_ratio", "distance_km")]
 
-node_scaler = StandardScaler()
+node_scaler   = StandardScaler()
 node_features = node_scaler.fit_transform(all_nodes.select(feat_cols).to_numpy().astype(np.float32))
 
-edge_scaler = StandardScaler()
+for split_name, df in [("train", X_train), ("test", X_test), ("inference", X_inference)]:
+    nulls = df.select(dyadic_cols).null_count()
+    bad = {c: nulls[c][0] for c in dyadic_cols if nulls[c][0] > 0}
+    if bad:
+        raise ValueError(f"NaN in {split_name} dyadic columns {bad}; fix upstream in data.py")
+
+edge_scaler  = StandardScaler()
 X_train_edge = edge_scaler.fit_transform(X_train.select(dyadic_cols).to_numpy().astype(np.float32))
-X_test_edge = edge_scaler.transform(X_test.select(dyadic_cols).to_numpy().astype(np.float32))
+X_test_edge  = edge_scaler.transform(X_test.select(dyadic_cols).to_numpy().astype(np.float32))
 X_infer_edge = edge_scaler.transform(X_inference.select(dyadic_cols).to_numpy().astype(np.float32))
 
 state_from_code = (all_nodes["city_code"] // 100000).to_numpy().astype(np.int64)
@@ -91,23 +126,27 @@ if os.path.exists(centroid_cache):
     cent = pl.read_csv(centroid_cache)
     code_to_latlon = {int(c): (float(la), float(lo))
                       for c, la, lo in zip(cent["code_muni"], cent["lat"], cent["lon"])}
-    muni = geobr.read_municipality(year=2010, simplified=True, verbose=False)
 else:
-    muni = geobr.read_municipality(year=2010, simplified=True, verbose=False)
+    muni_src = geobr.read_municipality(year=2010, simplified=True, verbose=False)
     code_to_latlon = {
         int(row["code_muni"]): (float(row.geometry.centroid.y), float(row.geometry.centroid.x))
-        for _, row in muni.iterrows()
+        for _, row in muni_src.iterrows()
     }
+    pl.DataFrame({"code_muni": list(code_to_latlon),
+                  "lat": [v[0] for v in code_to_latlon.values()],
+                  "lon": [v[1] for v in code_to_latlon.values()]}).write_csv(centroid_cache)
 
 node_lat = np.array([code_to_latlon.get(c, (np.nan, np.nan))[0] for c in city_codes])
 node_lon = np.array([code_to_latlon.get(c, (np.nan, np.nan))[1] for c in city_codes])
 has_coords = ~np.isnan(node_lat)
+
 for i in np.where(~has_coords)[0]:
     peers = np.where((state_from_code == state_from_code[i]) & has_coords)[0]
     if len(peers):
         node_lat[i], node_lon[i] = node_lat[peers].mean(), node_lon[peers].mean()
     else:
         node_lat[i], node_lon[i] = -15.78, -47.93
+    has_coords[i] = True
 
 K = 5
 w = KNN.from_array(np.stack([node_lon, node_lat], axis=1), k=K)
@@ -116,8 +155,35 @@ src_list, dst_list, wt_list = [], [], []
 for i, neighbors in w.neighbors.items():
     for j, wij in zip(neighbors, w.weights[i]):
         src_list.append(j); dst_list.append(i); wt_list.append(wij)
-adj_edge_index = torch.tensor(np.array([src_list, dst_list]), dtype=torch.long, device=device)
-adj_weights = torch.tensor(np.array(wt_list), dtype=torch.float, device=device)
+adj_edge_index = torch.tensor(np.array([src_list, dst_list]), dtype=torch.long)
+adj_weights    = torch.tensor(np.array(wt_list), dtype=torch.float)
+
+gravity_edge_idx = [i for i, c in enumerate(dyadic_cols) if c in ("pop_ratio", "distance_km")]
+
+x = torch.tensor(node_features, dtype=torch.float)
+deg = torch.zeros(x.shape[0])
+deg.index_add_(0, adj_edge_index[1], torch.ones(adj_edge_index.shape[1]))
+Wx = torch.zeros_like(x)
+Wx.index_add_(0, adj_edge_index[1], x[adj_edge_index[0]])
+Wx = Wx / deg.clamp(min=1).unsqueeze(1)
+
+def map_to_node_idx(df, col):
+    return (df.select(col).rename({col: "city_code"})
+              .join(city_map_df, on="city_code", how="left")["node_idx"].to_numpy())
+
+def make_tensors(X, Y, X_edge):
+    src = torch.tensor(map_to_node_idx(X, "source_code"), dtype=torch.long)
+    dst = torch.tensor(map_to_node_idx(X, "dest_code"),   dtype=torch.long)
+    ea  = torch.tensor(X_edge, dtype=torch.float)
+    y   = torch.tensor(Y[y_col].to_numpy().astype(np.float32), dtype=torch.float)
+    return src, dst, ea, y
+
+src_train, dst_train, ea_train, y_train = make_tensors(X_train,     Y_train,     X_train_edge)
+src_test,  dst_test,  ea_test,  y_test  = make_tensors(X_test,      Y_test,      X_test_edge)
+src_infer, dst_infer, ea_infer, y_infer = make_tensors(X_inference, Y_inference, X_infer_edge)
+
+log(f"nodes {x.shape[0]} | node_dim {x.shape[1]} | edge_dim {ea_train.shape[1]} | "
+    f"train {src_train.shape[0]} | test {src_test.shape[0]} | infer {src_infer.shape[0]}")
 
 
 class ResidualBlock(nn.Module):
@@ -132,20 +198,13 @@ class ResidualBlock(nn.Module):
 
 
 class SpatialGatedDG(nn.Module):
-    """Two income-conditioned climate gates: one used when a city plays the
-    source role in an edge, one used when it plays the destination role.
-    Trained with an L1 penalty on the effective FiLM multiplier |1+gamma|
-    (and |beta|), so a closed gate (climate blocked) is the default and the
-    model only opens a gate where doing so improves flow prediction enough
-    to pay for it. See model.py for the training-time loss term."""
-
     def __init__(self, node_dim, edge_dim, income_idx, climate_idx, gravity_edge_idx,
                  hidden=4096, out=256, heads=4, dropout=0.4):
         super().__init__()
         H, O, D = hidden, out, dropout
 
-        self.register_buffer("income_idx",      torch.tensor(income_idx, dtype=torch.long))
-        self.register_buffer("climate_idx",      torch.tensor(climate_idx, dtype=torch.long))
+        self.register_buffer("income_idx", torch.tensor(income_idx, dtype=torch.long))
+        self.register_buffer("climate_idx", torch.tensor(climate_idx, dtype=torch.long))
         self.register_buffer("gravity_edge_idx", torch.tensor(gravity_edge_idx, dtype=torch.long))
 
         def make_gate_net():
@@ -160,6 +219,7 @@ class SpatialGatedDG(nn.Module):
         self.res1  = nn.Linear(node_dim, H, bias=False)
         self.norm1 = nn.LayerNorm(H)
 
+        assert H % heads == 0
         self.conv2 = GATConv(H, H // heads, heads=heads, dropout=D, concat=True)
         self.norm2 = nn.LayerNorm(H)
 
@@ -192,10 +252,6 @@ class SpatialGatedDG(nn.Module):
         self.recon_self = nn.Sequential(nn.Linear(O, H), nn.GELU(), nn.Linear(H, node_dim))
         self.recon_lag  = nn.Sequential(nn.Linear(O, H), nn.GELU(), nn.Linear(H, node_dim))
 
-    def gate_logits(self, x, role):
-        net = self.income_gate_net_src if role == "src" else self.income_gate_net_dst
-        return net(x[:, self.income_idx])
-
     def get_film_params(self, x, role):
         net = self.income_gate_net_src if role == "src" else self.income_gate_net_dst
         params = net(x[:, self.income_idx])
@@ -208,499 +264,344 @@ class SpatialGatedDG(nn.Module):
         climate_feats = x[:, self.climate_idx]
         x_in[:, self.climate_idx] = (1.0 + gamma) * climate_feats + beta
         h = self.norm1(F.elu(self.conv1(x_in, edge_index)) + self.res1(x_in))
+        h = F.dropout(h, p=0.3, training=self.training)
         h = self.norm2(F.elu(self.conv2(h, edge_index)) + h)
+        h = F.dropout(h, p=0.3, training=self.training)
         h = self.norm3(F.elu(self.conv3(h, edge_index)) + self.res3(h))
         return h
 
     def decode(self, h_src, h_dst, edge_attr):
         s, d = self.src_proj(h_src), self.dst_proj(h_dst)
         edge_proj = self.edge_proj(edge_attr)
-        dec_in  = torch.cat([s, d, s * d, edge_proj], dim=1)
+        dec_in = torch.cat([s, d, s * d, edge_proj], dim=1)
         gravity = self.gravity_skip(edge_attr[:, self.gravity_edge_idx]).squeeze(-1)
         out = self.decoder(dec_in).squeeze(-1) + self.decoder_skip(dec_in).squeeze(-1) + gravity
         return F.softplus(out)
 
+    def forward(self, x, edge_index, edge_attr, src_idx, dst_idx):
+        h_src = self.encode(x, edge_index, "src")
+        h_dst = self.encode(x, edge_index, "dst")
+        return self.decode(h_src[src_idx], h_dst[dst_idx], edge_attr)
+
+
+def cpc(pred, target):
+    p, t = pred.detach().cpu().numpy(), target.detach().cpu().numpy()
+    return 2 * np.sum(np.minimum(p, t)) / (np.sum(p) + np.sum(t) + 1e-8)
+
+def rmse(pred, target):
+    return torch.sqrt(((pred - target) ** 2).mean()).item()
+
+def morans_i(values, edge_index, edge_weights):
+    values = values.to(torch.float)
+    v = values - values.mean()
+    src, dst = edge_index[0], edge_index[1]
+    num   = (edge_weights * v[src] * v[dst]).sum()
+    S0    = edge_weights.sum() + 1e-8
+    denom = (v ** 2).sum() + 1e-8
+    return (values.shape[0] / S0 * num / denom).item()
+
+def morans_i_test(values, edge_index, edge_weights, n_perm=999, seed=42):
+    obs = morans_i(values, edge_index, edge_weights)
+    rng_local = np.random.default_rng(seed)
+    v_np = values.cpu().numpy()
+    n = v_np.shape[0]
+    edge_index_cpu, edge_weights_cpu = edge_index.cpu(), edge_weights.cpu()
+    perm_stats = np.empty(n_perm)
+    for p in range(n_perm):
+        shuffled = torch.tensor(v_np[rng_local.permutation(n)], dtype=torch.float)
+        perm_stats[p] = morans_i(shuffled, edge_index_cpu, edge_weights_cpu)
+    z = (obs - perm_stats.mean()) / (perm_stats.std() + 1e-8)
+    p_value = (np.sum(np.abs(perm_stats) >= abs(obs)) + 1) / (n_perm + 1)
+    return obs, z, p_value
+
+devices   = ([torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+             if args.gpu and torch.cuda.is_available() else [torch.device("cpu")])
+dev       = devices[0]
+log(f"devices: {[str(d) for d in devices]}")
 
 model = SpatialGatedDG(
-    node_dim=node_features.shape[1], edge_dim=len(dyadic_cols),
+    node_dim=x.shape[1], edge_dim=ea_train.shape[1],
     income_idx=income_idx, climate_idx=climate_idx, gravity_edge_idx=gravity_edge_idx,
-    hidden=4096, out=1024, heads=8, dropout=0.3,
-).to(device)
+    hidden=4096, out=1024, heads=8, dropout=0.3
+).to(dev)
+log(f"parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+def to_dev(*tensors): return [t.to(dev) for t in tensors]
+x, Wx, adj_edge_index, adj_weights = to_dev(x, Wx, adj_edge_index, adj_weights)
+src_train, dst_train, ea_train, y_train = to_dev(src_train, dst_train, ea_train, y_train)
+src_test,  dst_test,  ea_test,  y_test  = to_dev(src_test,  dst_test,  ea_test,  y_test)
+src_infer, dst_infer, ea_infer, y_infer = to_dev(src_infer, dst_infer, ea_infer, y_infer)
 
 ckpt_path = f"the_gnn/best_sgdg_{args.name}.pt"
-model.load_state_dict(torch.load(ckpt_path, map_location=device))
+if not os.path.exists(ckpt_path):
+    raise FileNotFoundError(f"no checkpoint found at {ckpt_path}; this script does not train a model")
+
+log(f"loading checkpoint from {ckpt_path}")
+model.load_state_dict(torch.load(ckpt_path, map_location=dev))
 model.eval()
 
-x = torch.tensor(node_features, dtype=torch.float, device=device)
-
-
-def to_node_idx(df, col):
-    return torch.tensor([city_to_idx[c] for c in df[col].to_list()], dtype=torch.long, device=device)
-
-
-src_train, dst_train = to_node_idx(X_train, "source_code"), to_node_idx(X_train, "dest_code")
-ea_train = torch.tensor(X_train_edge, dtype=torch.float, device=device)
-src_test, dst_test = to_node_idx(X_test, "source_code"), to_node_idx(X_test, "dest_code")
-ea_test = torch.tensor(X_test_edge, dtype=torch.float, device=device)
-src_infer, dst_infer = to_node_idx(X_inference, "source_code"), to_node_idx(X_inference, "dest_code")
-ea_infer = torch.tensor(X_infer_edge, dtype=torch.float, device=device)
-
 with torch.no_grad():
-    h_src = model.encode(x, adj_edge_index, "src")
-    h_dst = model.encode(x, adj_edge_index, "dst")
+    h_src_final = model.encode(x, adj_edge_index, "src")
+    h_dst_final = model.encode(x, adj_edge_index, "dst")
+    pred_test  = model.decode(h_src_final[src_test],  h_dst_final[dst_test],  ea_test)
+    pred_infer = model.decode(h_src_final[src_infer], h_dst_final[dst_infer], ea_infer)
 
-    pred_train = model.decode(h_src[src_train], h_dst[dst_train], ea_train).cpu().numpy()
-    pred_test = model.decode(h_src[src_test], h_dst[dst_test], ea_test).cpu().numpy()
-    pred_infer = model.decode(h_src[src_infer], h_dst[dst_infer], ea_infer).cpu().numpy()
+    test_cpc, test_rmse   = cpc(pred_test, y_test),   rmse(pred_test, y_test)
+    infer_cpc, infer_rmse = cpc(pred_infer, y_infer), rmse(pred_infer, y_infer)
 
-    gate_src_all, _ = model.get_film_params(x, "src")
-    gate_dst_all, _ = model.get_film_params(x, "dst")
-    gate_src_all = gate_src_all.cpu().numpy()
-    gate_dst_all = gate_dst_all.cpu().numpy()
+    lag_r2  = 1 - (0.5 * (F.mse_loss(model.recon_lag(h_src_final),  Wx).item()
+                          + F.mse_loss(model.recon_lag(h_dst_final), Wx).item())) / Wx.var().item()
+    self_r2 = 1 - (0.5 * (F.mse_loss(model.recon_self(h_src_final), x).item()
+                          + F.mse_loss(model.recon_self(h_dst_final), x).item())) / x.var().item()
 
-gate_mean_src = gate_src_all.mean(axis=1)
-gate_mean_dst = gate_dst_all.mean(axis=1)
+    gamma_src, beta_src = model.get_film_params(x, "src")
+    gamma_dst, beta_dst = model.get_film_params(x, "dst")
 
-mult_src_all = np.abs(1.0 + gate_src_all)
-mult_dst_all = np.abs(1.0 + gate_dst_all)
-mult_mean_src = mult_src_all.mean(axis=1)
-mult_mean_dst = mult_dst_all.mean(axis=1)
+    mean_gamma_src = gamma_src.cpu().numpy()
+    mean_beta_src  = beta_src.cpu().numpy()
+    mean_gamma_dst = gamma_dst.cpu().numpy()
+    mean_beta_dst  = beta_dst.cpu().numpy()
 
-muni["code_muni"] = muni["code_muni"].astype(int)
+log("=" * 60)
+log(f"test  CPC {test_cpc:.4f}  RMSE {test_rmse:.2f}")
+log(f"infer CPC {infer_cpc:.4f}  RMSE {infer_rmse:.2f}")
+log(f"lag reconstruction R2 {lag_r2:.4f}  |  self reconstruction R2 {self_r2:.4f}")
+log("=" * 60)
 
+income_col_idx = next((i for i, c in enumerate(feat_cols) if "mean_income" in c), None)
+raw_income = None
+valid = None
+q1 = q2 = None
+if income_col_idx is not None:
+    raw_income = all_nodes[feat_cols[income_col_idx]].to_numpy()
+    valid = ~np.isnan(raw_income)
+    q1, q2 = np.nanquantile(raw_income, [1/3, 2/3])
 
-def save_choropleth(values_df, value_col, title, filename, cmap="Reds",
-                     center_zero=False, log_scale=False, log_floor_percentile=5):
-    merged = muni.merge(values_df.to_pandas(), on="code_muni", how="left")
-    fig, ax = plt.subplots(figsize=(10, 10))
-    plot_kwargs = dict(column=value_col, cmap=cmap, legend=True, ax=ax,
-                        missing_kwds={"color": "lightgrey", "label": "no data"})
+for role, (gamma_val, beta_val) in [("src", (mean_gamma_src, mean_beta_src)),
+                                    ("dst", (mean_gamma_dst, mean_beta_dst))]:
+    gmean, gstd = float(gamma_val.mean()), float(gamma_val.std())
+    bmean, bstd = float(beta_val.mean()), float(beta_val.std())
+    log(f"FiLM [{role}] -> Gamma mean {gmean:.4f} (std {gstd:.4f}) | Beta mean {bmean:.4f} (std {bstd:.4f})")
+    if raw_income is not None:
+        corr, pval = spearmanr(raw_income[valid], gamma_val.mean(axis=1)[valid])
+        log(f"  gamma[{role}] ~ income spearman r={corr:.4f} p={pval:.3e}")
+        for label, mask in [("low", raw_income <= q1),
+                            ("mid", (raw_income > q1) & (raw_income <= q2)),
+                            ("high", raw_income > q2)]:
+            log(f"    gamma[{role}] by income tertile [{label:4s}]: {gamma_val[mask].mean():.4f}  n={mask.sum()}")
 
-    if log_scale:
-        vals = merged[value_col].to_numpy()
-        positive = vals[np.isfinite(vals) & (vals > 0)]
-        if len(positive) == 0:
-            print(f"skipped {filename}: no positive values available for log scale")
-            plt.close(fig)
-            return
-        vmin = max(np.percentile(positive, log_floor_percentile), 1e-6)
-        vmax = positive.max()
-        dropped = int(((vals <= 0) | ~np.isfinite(vals)).sum())
-        if dropped:
-            print(f"{filename}: {dropped} cities with value <= 0 shown as missing under log scale")
-        merged.loc[(merged[value_col] <= 0) | (~np.isfinite(merged[value_col])), value_col] = np.nan
-        plot_kwargs["norm"] = LogNorm(vmin=vmin, vmax=vmax)
-    elif center_zero:
-        vmax = np.nanmax(np.abs(merged[value_col]))
-        plot_kwargs.update(vmin=-vmax, vmax=vmax)
+log("=" * 60)
 
-    merged.plot(**plot_kwargs)
-    ax.set_title(title)
-    ax.axis("off")
-    fig.savefig(f"the_gnn/maps/{filename}", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"saved maps/{filename}")
-
-
-TRAIN_CMAP, TEST_INFER_CMAP = "PuOr", "RdBu_r"
-
-out_train = (
-    pl.DataFrame({"code_muni": X_train["source_code"].to_numpy(), "pred_flow": pred_train})
-    .group_by("code_muni").agg(pl.col("pred_flow").sum())
-)
-out_test_infer = (
-    pl.DataFrame({
-        "code_muni": np.concatenate([X_test["source_code"].to_numpy(), X_inference["source_code"].to_numpy()]),
-        "pred_flow": np.concatenate([pred_test, pred_infer]),
-    })
-    .group_by("code_muni").agg(pl.col("pred_flow").sum())
-)
-save_choropleth(out_train, "pred_flow", "Predicted total out-migration pressure (train set)",
-                 "out_migration_pressure_train.png", cmap=TRAIN_CMAP)
-save_choropleth(out_train, "pred_flow", "Predicted total out-migration pressure (train set, log scale)",
-                 "out_migration_pressure_train_log.png", cmap=TRAIN_CMAP, log_scale=True)
-save_choropleth(out_test_infer, "pred_flow", "Predicted total out-migration pressure (test + inference)",
-                 "out_migration_pressure_test_infer.png", cmap=TEST_INFER_CMAP)
-save_choropleth(out_test_infer, "pred_flow", "Predicted total out-migration pressure (test + inference, log scale)",
-                 "out_migration_pressure_test_infer_log.png", cmap=TEST_INFER_CMAP, log_scale=True)
-
-
-def compute_net_migration(df, pred):
-    out_p = (pl.DataFrame({"code_muni": df["source_code"].to_numpy(), "pred_flow": pred})
-             .group_by("code_muni").agg(pl.col("pred_flow").sum().alias("out_flow")))
-    in_p = (pl.DataFrame({"code_muni": df["dest_code"].to_numpy(), "pred_flow": pred})
-            .group_by("code_muni").agg(pl.col("pred_flow").sum().alias("in_flow")))
-    return (out_p.join(in_p, on="code_muni", how="outer")
-            .fill_null(0.0)
-            .with_columns((pl.col("in_flow") - pl.col("out_flow")).alias("net_migration")))
-
-
-net_train = compute_net_migration(X_train, pred_train)
-combined_pairs = pl.concat([
-    X_test.select(["source_code", "dest_code"]),
-    X_inference.select(["source_code", "dest_code"]),
-])
-combined_pred = np.concatenate([pred_test, pred_infer])
-net_test_infer = compute_net_migration(combined_pairs, combined_pred)
-save_choropleth(net_train, "net_migration", "Predicted net migration (train set, inflow - outflow)",
-                 "net_migration_train.png", cmap=TRAIN_CMAP, center_zero=True)
-save_choropleth(net_test_infer, "net_migration", "Predicted net migration (test + inference, inflow - outflow)",
-                 "net_migration_test_infer.png", cmap=TEST_INFER_CMAP, center_zero=True)
-
-gate_df = pl.DataFrame({
-    "code_muni": city_codes,
-    "gate_src": gate_mean_src,
-    "gate_dst": gate_mean_dst,
-    "gate_asymmetry": gate_mean_src - gate_mean_dst,
-})
-save_choropleth(gate_df, "gate_src", "Climate-signal gate activation, source role (higher = climate more influential)",
-                 "gate_activation_src.png", cmap="PuOr")
-save_choropleth(gate_df, "gate_dst", "Climate-signal gate activation, destination role (higher = climate more influential)",
-                 "gate_activation_dst.png", cmap="PuOr")
-save_choropleth(gate_df, "gate_asymmetry",
-                 "Gate asymmetry: climate weighted more as origin (+) vs as destination (-)",
-                 "gate_activation_asymmetry.png", cmap="RdBu_r", center_zero=True)
-
-
-def load_actual_flow(df, split_name):
-    if "flow" in df.columns:
-        return df["flow"].to_numpy()
-    return pl.read_csv(f"data/y_{split_name}.csv")["flow"].to_numpy()
-
-
-y_train_actual = load_actual_flow(X_train, "train")
-y_test_actual = load_actual_flow(X_test, "test")
-y_infer_actual = load_actual_flow(X_inference, "inference")
-
-resid_train = pred_train - y_train_actual
-resid_test = pred_test - y_test_actual
-resid_infer = pred_infer - y_infer_actual
-
-resid_train_df = (
-    pl.DataFrame({"code_muni": X_train["source_code"].to_numpy(), "resid": resid_train})
-    .group_by("code_muni").agg(pl.col("resid").mean())
-)
-resid_test_infer_df = (
-    pl.DataFrame({
-        "code_muni": np.concatenate([X_test["source_code"].to_numpy(), X_inference["source_code"].to_numpy()]),
-        "resid": np.concatenate([resid_test, resid_infer]),
-    })
-    .group_by("code_muni").agg(pl.col("resid").mean())
-)
-save_choropleth(resid_train_df, "resid", "Mean prediction residual by origin city (train set)",
-                 "residuals_train.png", cmap=TRAIN_CMAP, center_zero=True)
-save_choropleth(resid_test_infer_df, "resid", "Mean prediction residual by origin city (test + inference)",
-                 "residuals_test_infer.png", cmap=TEST_INFER_CMAP, center_zero=True)
-
-income_col = next((c for c in feat_cols if "gdp_per_capita" in c.lower()), None)
-if income_col:
-    income_df = pl.DataFrame({"code_muni": city_codes, "income": all_nodes[income_col].to_numpy()})
-    save_choropleth(income_df, "income", "GDP per capita by municipality",
-                     "income_reference.png", cmap="Greens")
-    save_choropleth(income_df, "income", "GDP per capita by municipality (log scale)",
-                     "income_reference_log.png", cmap="Greens", log_scale=True)
-
-os.makedirs("the_gnn/maps/climate_gates", exist_ok=True)
-for ci, name in enumerate(climate_names):
-    feat_df = pl.DataFrame({
-        "code_muni": city_codes,
-        "gate_src": gate_src_all[:, ci],
-        "gate_dst": gate_dst_all[:, ci],
-    })
-    save_choropleth(feat_df, "gate_src", f"Gate activation for {name} (source role)",
-                     f"climate_gates/gate_src_{name}.png", cmap="PuOr")
-    save_choropleth(feat_df, "gate_dst", f"Gate activation for {name} (destination role)",
-                     f"climate_gates/gate_dst_{name}.png", cmap="PuOr")
-
-gravity_design_train = np.column_stack([
-    np.ones(len(X_train)), X_train.select(["distance_km", "pop_ratio"]).to_numpy().astype(np.float64),
-])
-gravity_coef, *_ = np.linalg.lstsq(gravity_design_train, y_train_actual.astype(np.float64), rcond=None)
-
-gravity_design_test = np.column_stack([
-    np.ones(len(X_test)), X_test.select(["distance_km", "pop_ratio"]).to_numpy().astype(np.float64),
-])
-gravity_pred_test = gravity_design_test @ gravity_coef
-gravity_resid_test = y_test_actual.astype(np.float64) - gravity_pred_test
-
-improvement_df = (
-    pl.DataFrame({
-        "code_muni": X_test["source_code"].to_numpy(),
-        "abs_gravity_resid": np.abs(gravity_resid_test),
-        "abs_model_resid": np.abs(resid_test),
-    })
-    .group_by("code_muni")
-    .agg([pl.col("abs_gravity_resid").mean(), pl.col("abs_model_resid").mean()])
-    .with_columns((pl.col("abs_gravity_resid") - pl.col("abs_model_resid")).alias("gnn_improvement"))
-)
-save_choropleth(improvement_df, "gnn_improvement",
-                 "Error reduction vs gravity baseline (+ = GNN more accurate)",
-                 "gnn_vs_gravity_improvement.png", cmap="RdBu_r", center_zero=True)
-
-os.makedirs("the_gnn/maps/mechanism", exist_ok=True)
-plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 12,
-    "axes.spines.top": False,
-    "axes.spines.right": False,
-    "axes.edgecolor": "#333333",
-    "axes.labelcolor": "#222222",
-    "text.color": "#222222",
-    "figure.dpi": 200,
-})
-
-raw_income = all_nodes[income_col].to_numpy() if income_col else None
-
-
-def binned_trend(x_vals, y_vals, n_bins=20):
-    """Equal-count income bins with mean +/- SEM per bin, for a clean trend
-    line over noisy per-city scatter."""
-    valid = np.isfinite(x_vals) & np.isfinite(y_vals)
-    x_vals, y_vals = x_vals[valid], y_vals[valid]
-    order = np.argsort(x_vals)
-    x_sorted, y_sorted = x_vals[order], y_vals[order]
-    edges = np.array_split(np.arange(len(x_sorted)), n_bins)
-    bin_x, bin_y, bin_se = [], [], []
-    for idx in edges:
-        if len(idx) == 0:
-            continue
-        bin_x.append(x_sorted[idx].mean())
-        bin_y.append(y_sorted[idx].mean())
-        bin_se.append(y_sorted[idx].std(ddof=1) / max(np.sqrt(len(idx)), 1))
-    return np.array(bin_x), np.array(bin_y), np.array(bin_se)
-
-
-def income_vs_gate_plot(income, mult_src, mult_dst, filename,
-                         title="Climate signal passed through the income gate",
-                         log_x=True):
-    fig, ax = plt.subplots(figsize=(8, 6))
-
-    valid = np.isfinite(income) & (income > 0 if log_x else np.isfinite(income))
-    inc = income[valid]
-
-    for mult, label, color in [(mult_src[valid], "Origin role", "#c0522d"),
-                                (mult_dst[valid], "Destination role", "#2d6ac0")]:
-        ax.scatter(inc, mult, s=10, alpha=0.15, color=color, linewidths=0)
-        bx, by, bse = binned_trend(inc, mult, n_bins=20)
-        ax.plot(bx, by, color=color, linewidth=2.4, label=label)
-        ax.fill_between(bx, by - 1.96 * bse, by + 1.96 * bse, color=color, alpha=0.18)
-
-    if log_x:
-        ax.set_xscale("log")
-    ax.axhline(1.0, color="#888888", linewidth=1, linestyle="--", zorder=0)
-    ax.text(ax.get_xlim()[1], 1.02, "fully open (=1)", ha="right", va="bottom",
-            color="#888888", fontsize=9)
-    ax.set_ylim(bottom=0)
-    ax.set_xlabel("City income (GDP per capita, log scale)" if log_x else "City income (GDP per capita)")
-    ax.set_ylabel(r"Effective climate gate multiplier  $|1+\gamma|$")
-    ax.set_title(title, fontsize=13, pad=12)
-    ax.legend(frameon=False, loc="upper right")
-    ax.grid(alpha=0.15, linewidth=0.6)
-    fig.tight_layout()
-    fig.savefig(f"the_gnn/maps/mechanism/{filename}", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"saved maps/mechanism/{filename}")
-
+for role, gamma_val in [("src", mean_gamma_src), ("dst", mean_gamma_dst)]:
+    node_gamma_summary = gamma_val.mean(axis=1)
+    i_gate, z_gate, p_gate = morans_i_test(
+        torch.tensor(node_gamma_summary, dtype=torch.float, device=dev), adj_edge_index, adj_weights, args.n_perm, 42)
+    log(f"  gamma_mean[{role}] activations   I={i_gate:+.4f}  z={z_gate:+.2f}  p={p_gate:.4f}")
 
 if raw_income is not None:
-    income_vs_gate_plot(raw_income, mult_mean_src, mult_mean_dst,
-                         "income_vs_gate_openness.png")
+    i_inc, z_inc, p_inc = morans_i_test(
+        torch.tensor(raw_income, dtype=torch.float, device=dev), adj_edge_index, adj_weights, args.n_perm, 42)
+    log(f"  raw income                I={i_inc:+.4f}  z={z_inc:+.2f}  p={p_inc:.4f}")
 
-    n_feat = len(climate_names)
+def node_mean_residual(pred, y, src_idx):
+    resid = (pred - y).detach().cpu().numpy()
+    df = pl.DataFrame({"node": src_idx.detach().cpu().numpy(), "resid": resid}).group_by("node").agg(pl.col("resid").mean())
+    arr  = np.zeros(num_nodes, dtype=np.float32)
+    mask = np.zeros(num_nodes, dtype=bool)
+    nodes, resids = df["node"].to_numpy(), df["resid"].to_numpy().astype(np.float32)
+    arr[nodes], mask[nodes] = resids, True
+    return arr, mask
+
+def moran_on_subgraph(values, mask, n_perm, seed):
+    edge_np  = adj_edge_index.cpu().numpy()
+    sub_mask = mask[edge_np[0]] & mask[edge_np[1]]
+    if mask.sum() < 10 or sub_mask.sum() < 10:
+        return None
+    sub_idx = torch.tensor(sub_mask, device=dev)
+    return morans_i_test(torch.tensor(values, dtype=torch.float, device=dev),
+                         adj_edge_index[:, sub_idx], adj_weights[sub_idx], n_perm, seed)
+
+model_resid, model_mask = node_mean_residual(pred_test, y_test, src_test)
+result = moran_on_subgraph(model_resid, model_mask, args.n_perm, 42)
+if result:
+    i_m, z_m, p_m = result
+    log(f"  model residual / node     I={i_m:+.4f}  z={z_m:+.2f}  p={p_m:.4f}  n={int(model_mask.sum())}")
+
+log("=" * 60)
+
+if raw_income is not None:
+    src_test_income = raw_income[src_test.cpu().numpy()]
+    groups = {
+        "low":  src_test_income <= q1,
+        "mid":  (src_test_income > q1) & (src_test_income <= q2),
+        "high": src_test_income > q2,
+    }
+    group_masks = {k: torch.tensor(v, device=dev) for k, v in groups.items()}
+    for feat_name in ["wet_bulb_F", "temp", "precip", "ndvi", "wind_mean", "uv_log_mean_annual", "mean_income_brl"]:
+        if feat_name not in feat_cols:
+            continue
+        fi = feat_cols.index(feat_name)
+        x_perm = x.clone()
+        x_perm[:, fi] = x_perm[torch.randperm(x_perm.shape[0]), fi]
+        with torch.no_grad():
+            h_p_src = model.encode(x_perm, adj_edge_index, "src")
+            h_p_dst = model.encode(x_perm, adj_edge_index, "dst")
+            perm_pred = model.decode(h_p_src[src_test], h_p_dst[dst_test], ea_test)
+        row = []
+        for label, mask in group_masks.items():
+            base_g = cpc(pred_test[mask], y_test[mask])
+            perm_g = cpc(perm_pred[mask], y_test[mask])
+            row.append(f"{label}={base_g - perm_g:+.5f}")
+        log(f"  {feat_name:25s}  " + "  ".join(row))
+log("=" * 60)
+
+importance_targets = sorted(set(income_idx) | set(climate_idx))
+log(f"node feature importance, restricted set (n={len(importance_targets)})")
+node_importances = []
+for i in importance_targets:
+    name = feat_cols[i]
+    x_perm = x.clone()
+    x_perm[:, i] = x_perm[torch.randperm(x_perm.shape[0]), i]
+    with torch.no_grad():
+        h_p_src = model.encode(x_perm, adj_edge_index, "src")
+        h_p_dst = model.encode(x_perm, adj_edge_index, "dst")
+        sc = cpc(model.decode(h_p_src[src_test], h_p_dst[dst_test], ea_test), y_test)
+    node_importances.append((name, test_cpc - sc))
+node_importances.sort(key=lambda t: t[1], reverse=True)
+for name, imp in node_importances:
+    log(f"  {name:45s}  {imp:+.5f}")
+
+log("edge feature importance (drop in test CPC)")
+edge_importances = []
+for i, name in enumerate(dyadic_cols):
+    ea_perm = ea_test.clone()
+    ea_perm[:, i] = ea_perm[torch.randperm(ea_perm.shape[0]), i]
+    with torch.no_grad():
+        sc = cpc(model.decode(h_src_final[src_test], h_dst_final[dst_test], ea_perm), y_test)
+    edge_importances.append((name, test_cpc - sc))
+edge_importances.sort(key=lambda t: t[1], reverse=True)
+for name, imp in edge_importances:
+    log(f"  {name:30s}  {imp:+.5f}")
+
+np.savez(f"the_gnn/climate_embeddings_{args.name}.npz",
+         climate_names=np.array([feat_cols[i] for i in climate_idx]),
+         gamma_src=mean_gamma_src, beta_src=mean_beta_src,
+         gamma_dst=mean_gamma_dst, beta_dst=mean_beta_dst,
+         h_src=h_src_final.cpu().numpy(), h_dst=h_dst_final.cpu().numpy())
+log(f"saved gates + embeddings -> the_gnn/climate_embeddings_{args.name}.npz")
+
+# =================================================================
+# PLOTS
+# =================================================================
+
+if raw_income is not None:
+    for role, gamma_val in [("src", mean_gamma_src), ("dst", mean_gamma_dst)]:
+        gate_mean = gamma_val.mean(axis=1)
+        corr, pval = spearmanr(raw_income[valid], gate_mean[valid])
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.scatter(raw_income[valid], gate_mean[valid], s=14, alpha=0.35,
+                   color="#2c7fb8", edgecolor="none")
+        z = np.polyfit(raw_income[valid], gate_mean[valid], 1)
+        xs = np.linspace(raw_income[valid].min(), raw_income[valid].max(), 200)
+        ax.plot(xs, z[0] * xs + z[1], color="#d7301f", linewidth=2.2)
+        ax.set_xlabel("Mean Household Income (BRL)")
+        ax.set_ylabel(r"Mean Climate Gate Activation ($\gamma$)")
+        ax.set_title(f"Income vs. Climate Gate ({role})\nSpearman $r$={corr:.3f}, $p$={pval:.1e}")
+        savefig(fig, f"income_vs_gate_{role}")
+
+    climate_names_all = [feat_cols[i] for i in climate_idx]
+    n_feats = len(climate_names_all)
     ncols = 3
-    nrows = int(np.ceil(n_feat / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.6 * nrows), sharex=True)
-    axes = np.atleast_1d(axes).flatten()
-    valid = np.isfinite(raw_income) & (raw_income > 0)
-    for ci, name in enumerate(climate_names):
-        ax = axes[ci]
-        inc = raw_income[valid]
-        m_src = mult_src_all[valid, ci]
-        m_dst = mult_dst_all[valid, ci]
-        bx_s, by_s, _ = binned_trend(inc, m_src, n_bins=15)
-        bx_d, by_d, _ = binned_trend(inc, m_dst, n_bins=15)
-        ax.plot(bx_s, by_s, color="#c0522d", linewidth=1.8, label="Origin")
-        ax.plot(bx_d, by_d, color="#2d6ac0", linewidth=1.8, label="Destination")
-        ax.axhline(1.0, color="#aaaaaa", linewidth=0.8, linestyle="--")
-        ax.set_xscale("log")
-        ax.set_title(name, fontsize=10)
-        ax.set_ylim(bottom=0)
-        ax.grid(alpha=0.15, linewidth=0.5)
-    for ax in axes[n_feat:]:
-        ax.axis("off")
-    axes[0].legend(frameon=False, fontsize=9, loc="upper right")
-    fig.suptitle("Gate multiplier vs. income, by climate feature", fontsize=14, y=1.01)
-    fig.text(0.5, -0.01, "City income (GDP per capita, log scale)", ha="center")
-    fig.text(-0.01, 0.5, r"Gate multiplier $|1+\gamma|$", va="center", rotation="vertical")
-    fig.tight_layout()
-    fig.savefig("the_gnn/maps/mechanism/income_vs_gate_by_feature.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print("saved maps/mechanism/income_vs_gate_by_feature.png")
+    nrows = int(np.ceil(n_feats / ncols))
+    for role, gamma_val in [("src", mean_gamma_src), ("dst", mean_gamma_dst)]:
+        fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows))
+        axes = np.array(axes).reshape(-1)
+        for ci, name in enumerate(climate_names_all):
+            ax = axes[ci]
+            g = gamma_val[:, ci]
+            ax.scatter(raw_income[valid], g[valid], s=8, alpha=0.3,
+                       color="#41ab5d", edgecolor="none")
+            corr, pval = spearmanr(raw_income[valid], g[valid])
+            ax.set_title(f"{name}\n$r$={corr:.2f}", fontsize=15)
+            ax.tick_params(labelsize=12)
+        for j in range(n_feats, len(axes)):
+            axes[j].axis("off")
+        fig.suptitle(f"Income vs. Per-Feature Climate Gate ({role})")
+        savefig(fig, f"income_vs_gate_perfeature_{role}")
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    valid = np.isfinite(raw_income) & (raw_income > 0)
-    inc = raw_income[valid]
-    asym = mult_mean_src[valid] - mult_mean_dst[valid]
-    ax.scatter(inc, asym, s=10, alpha=0.15, color="#555555", linewidths=0)
-    bx, by, bse = binned_trend(inc, asym, n_bins=20)
-    ax.plot(bx, by, color="#5b2d8c", linewidth=2.4)
-    ax.fill_between(bx, by - 1.96 * bse, by + 1.96 * bse, color="#5b2d8c", alpha=0.18)
-    ax.axhline(0.0, color="#888888", linewidth=1, linestyle="--")
-    ax.set_xscale("log")
-    ax.set_xlabel("City income (GDP per capita, log scale)")
-    ax.set_ylabel("Gate asymmetry (origin multiplier - destination multiplier)")
-    ax.set_title("Does the origin/destination climate-sensitivity gap vary with income?", fontsize=13, pad=12)
-    ax.grid(alpha=0.15, linewidth=0.6)
-    fig.tight_layout()
-    fig.savefig("the_gnn/maps/mechanism/income_vs_gate_asymmetry.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print("saved maps/mechanism/income_vs_gate_asymmetry.png")
+pred_test_np = pred_test.detach().cpu().numpy()
+y_test_np = y_test.detach().cpu().numpy()
 
-    q1, q2 = np.nanquantile(raw_income[valid], [1 / 3, 2 / 3])
-    tertile_labels = np.select(
-        [raw_income <= q1, (raw_income > q1) & (raw_income <= q2), raw_income > q2],
-        ["Low income", "Mid income", "High income"], default="NA"
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
-    colors = {"Low income": "#c0522d", "Mid income": "#c9a13b", "High income": "#2d6ac0"}
-    for ax, mult, role in [(axes[0], mult_mean_src, "Origin role"), (axes[1], mult_mean_dst, "Destination role")]:
-        for label, color in colors.items():
-            mask = (tertile_labels == label) & np.isfinite(mult)
-            ax.hist(mult[mask], bins=30, alpha=0.55, color=color, label=label, density=True)
-        ax.axvline(1.0, color="#888888", linewidth=1, linestyle="--")
-        ax.set_title(role, fontsize=12)
-        ax.set_xlabel(r"Gate multiplier $|1+\gamma|$")
-        ax.grid(alpha=0.15, linewidth=0.5)
-    axes[0].set_ylabel("Density")
-    axes[0].legend(frameon=False, fontsize=9)
-    fig.suptitle("Distribution of climate gate openness by income tertile", fontsize=14)
-    fig.tight_layout()
-    fig.savefig("the_gnn/maps/mechanism/gate_distribution_by_tertile.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print("saved maps/mechanism/gate_distribution_by_tertile.png")
-else:
-    print("no GDP-per-capita column found in feat_cols -- skipping income x gate figures")
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.scatter(np.log1p(y_test_np), np.log1p(pred_test_np), s=10, alpha=0.3,
+           color="#6a51a3", edgecolor="none")
+lims = [0, max(np.log1p(y_test_np).max(), np.log1p(pred_test_np).max())]
+ax.plot(lims, lims, color="black", linewidth=1.5, linestyle="--")
+ax.set_xlabel("log(1 + True Flow)")
+ax.set_ylabel("log(1 + Predicted Flow)")
+ax.set_title(f"Predicted vs. True Flow (Test)\nCPC={test_cpc:.3f}  RMSE={test_rmse:.2f}")
+ax.set_xlim(lims); ax.set_ylim(lims)
+savefig(fig, "pred_vs_true_flow")
 
-def _get_state_basemap():
-    states = geobr.read_state(year=2010, simplified=True, verbose=False)
-    return states
+muni = geobr.read_municipality(code_muni="all", year=2020)
 
+def flow_graph_plot(src_idx_np, dst_idx_np, weights, title, fname, top_n, cmap_name="viridis"):
+    order = np.argsort(weights)[::-1][:top_n]
+    s_lat = np.array([code_to_latlon.get(city_codes[i], (np.nan, np.nan))[0] for i in src_idx_np[order]])
+    s_lon = np.array([code_to_latlon.get(city_codes[i], (np.nan, np.nan))[1] for i in src_idx_np[order]])
+    d_lat = np.array([code_to_latlon.get(city_codes[i], (np.nan, np.nan))[0] for i in dst_idx_np[order]])
+    d_lon = np.array([code_to_latlon.get(city_codes[i], (np.nan, np.nan))[1] for i in dst_idx_np[order]])
+    wgt = weights[order]
+    w_norm = (wgt - wgt.min()) / (wgt.max() - wgt.min() + 1e-8)
 
-def save_flow_map(
-    edges_df,
-    code_to_latlon,
-    value_col,
-    title,
-    filename,
-    top_n=150,
-    cmap="viridis",
-    curvature=0.15,
-    basemap=None,
-    node_values=None,
-    node_col=None,
-    node_cmap="Greys",
-    node_size_range=(6, 60),
-    figsize=(11, 11),
-    min_linewidth=0.4,
-    max_linewidth=4.0,
-    min_alpha=0.15,
-    max_alpha=0.9,
-):
-    if hasattr(edges_df, "to_pandas"):
-        edges_df = edges_df.to_pandas()
+    fig, ax = plt.subplots(figsize=(14, 14))
+    muni.boundary.plot(ax=ax, linewidth=0.15, color="#cccccc")
 
-    edges_df = edges_df.copy()
-    edges_df["abs_val"] = edges_df[value_col].abs()
-    edges_df = edges_df.sort_values("abs_val", ascending=False).head(top_n)
+    cmap = plt.get_cmap(cmap_name)
+    valid_edges = ~(np.isnan(s_lat) | np.isnan(d_lat))
+    for i in np.where(valid_edges)[0]:
+        ax.plot([s_lon[i], d_lon[i]], [s_lat[i], d_lat[i]],
+                color=cmap(w_norm[i]), linewidth=0.4 + 1.6 * w_norm[i],
+                alpha=0.15 + 0.5 * w_norm[i])
 
-    lat0 = edges_df["source_code"].map(lambda c: code_to_latlon.get(int(c), (np.nan, np.nan))[0])
-    lon0 = edges_df["source_code"].map(lambda c: code_to_latlon.get(int(c), (np.nan, np.nan))[1])
-    lat1 = edges_df["dest_code"].map(lambda c: code_to_latlon.get(int(c), (np.nan, np.nan))[0])
-    lon1 = edges_df["dest_code"].map(lambda c: code_to_latlon.get(int(c), (np.nan, np.nan))[1])
-    keep = lat0.notna() & lat1.notna()
-    edges_df = edges_df[keep]
-    lat0, lon0, lat1, lon1 = lat0[keep], lon0[keep], lat1[keep], lon1[keep]
+    sm_ = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=wgt.min(), vmax=wgt.max()))
+    cbar = fig.colorbar(sm_, ax=ax, fraction=0.03, pad=0.02)
+    cbar.set_label("Flow")
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=19, pad=15)
+    savefig(fig, fname)
 
-    if len(edges_df) == 0:
-        print(f"skipped {filename}: no plottable edges (missing centroids)")
-        return
+src_test_np = src_test.detach().cpu().numpy()
+dst_test_np = dst_test.detach().cpu().numpy()
 
-    if basemap is None:
-        basemap = _get_state_basemap()
+flow_graph_plot(src_test_np, dst_test_np, y_test_np,
+                title=f"True Migration Flow Network (Test, Top {args.top_edges} Edges)",
+                fname="true_flow_graph", top_n=args.top_edges)
 
-    fig, ax = plt.subplots(figsize=figsize)
-    basemap.plot(ax=ax, color="#f2f2f0", edgecolor="#bbbbbb", linewidth=0.6, zorder=0)
+flow_graph_plot(src_test_np, dst_test_np, pred_test_np,
+                title=f"Predicted Migration Flow Network (Test, Top {args.top_edges} Edges)",
+                fname="pred_flow_graph", top_n=args.top_edges)
 
-    vals = edges_df[value_col].to_numpy()
-    vmin, vmax = np.nanmin(vals), np.nanmax(vals)
-    norm = plt.Normalize(vmin=vmin, vmax=vmax)
-    colormap = plt.get_cmap(cmap)
+resid_arr, resid_mask = node_mean_residual(pred_test, y_test, src_test)
+resid_df = pl.DataFrame({
+    "city_code": [city_codes[i] for i in range(num_nodes) if resid_mask[i]],
+    "residual": resid_arr[resid_mask],
+})
+muni["code_muni"] = pd.to_numeric(muni["code_muni"], errors="coerce").fillna(0).astype(int)
+resid_map = muni.merge(resid_df.to_pandas(), left_on="code_muni", right_on="city_code", how="left")
 
-    abs_vals = edges_df["abs_val"].to_numpy()
-    amin, amax = abs_vals.min(), abs_vals.max()
-    denom = (amax - amin) if amax > amin else 1.0
-    lws = min_linewidth + (abs_vals - amin) / denom * (max_linewidth - min_linewidth)
-    alphas = min_alpha + (abs_vals - amin) / denom * (max_alpha - min_alpha)
-
-    order = np.argsort(abs_vals)
-    for idx in order:
-        row_lat0, row_lon0 = lat0.iloc[idx], lon0.iloc[idx]
-        row_lat1, row_lon1 = lat1.iloc[idx], lon1.iloc[idx]
-        color = colormap(norm(vals[idx]))
-        arrow = FancyArrowPatch(
-            (row_lon0, row_lat0), (row_lon1, row_lat1),
-            connectionstyle=f"arc3,rad={curvature}",
-            arrowstyle="-|>", mutation_scale=8,
-            color=color, linewidth=lws[idx], alpha=alphas[idx], zorder=2,
-        )
-        ax.add_patch(arrow)
-
-    if node_values is not None and node_col is not None:
-        if hasattr(node_values, "to_pandas"):
-            node_values = node_values.to_pandas()
-        n_lat = node_values["code_muni"].map(lambda c: code_to_latlon.get(int(c), (np.nan, np.nan))[0])
-        n_lon = node_values["code_muni"].map(lambda c: code_to_latlon.get(int(c), (np.nan, np.nan))[1])
-        n_val = node_values[node_col].to_numpy()
-        n_keep = n_lat.notna()
-        n_lat, n_lon, n_val = n_lat[n_keep], n_lon[n_keep], n_val[n_keep]
-
-        nabs = np.abs(n_val)
-        nmin, nmax = nabs.min(), nabs.max()
-        ndenom = (nmax - nmin) if nmax > nmin else 1.0
-        sizes = node_size_range[0] + (nabs - nmin) / ndenom * (node_size_range[1] - node_size_range[0])
-
-        sc = ax.scatter(
-            n_lon, n_lat, s=sizes, c=n_val, cmap=node_cmap,
-            edgecolor="black", linewidth=0.3, zorder=3,
-        )
-        fig.colorbar(sc, ax=ax, shrink=0.5, pad=0.02, label=node_col)
-
-    sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
-    sm.set_array([])
-    fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.06, label=value_col)
-
-    ax.set_title(title)
-    ax.set_xlim(basemap.total_bounds[[0, 2]])
-    ax.set_ylim(basemap.total_bounds[[1, 3]])
-    ax.axis("off")
-    fig.savefig(f"the_gnn/maps/{filename}", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"saved maps/{filename}")
-
-
-state_basemap = _get_state_basemap()
-
-flow_edges = X_train.select(["source_code", "dest_code"]).with_columns(pl.Series("pred_flow", pred_train))
-save_flow_map(flow_edges, code_to_latlon, value_col="pred_flow",
-              title="Top predicted migration flows (train set)",
-              filename="flow_map_top_predicted_train.png",
-              top_n=150, cmap="viridis", basemap=state_basemap,
-              node_values=net_train, node_col="net_migration", node_cmap="RdBu_r")
-
-gate_edge_df = X_train.select(["source_code", "dest_code"]).with_columns(
-    pl.Series("gate_strength", mult_mean_src[[city_to_idx[c] for c in X_train["source_code"]]])
+fig, ax = plt.subplots(figsize=(12, 12))
+resid_map.plot(
+    column="residual", cmap="RdBu_r", scheme="quantiles", k=7,
+    edgecolor="none", legend=True,
+    legend_kwds={"title": "Mean Residual\n(True - Predicted)", "loc": "lower left", "fmt": "{:.1f}"},
+    missing_kwds={"color": "#e0e0e0"},
+    ax=ax,
 )
-save_flow_map(gate_edge_df, code_to_latlon, value_col="gate_strength",
-              title="Predicted flows weighted by origin climate-gate openness",
-              filename="flow_map_gate_weighted.png",
-              top_n=150, cmap="PuOr", basemap=state_basemap)
+ax.set_axis_off()
+ax.set_title("Model Residuals by Source Municipality (Test)", fontsize=19, pad=15)
+savefig(fig, "residual_map")
+
+log(f"saved production plots -> {FIG_DIR}/")
+log_file.close()

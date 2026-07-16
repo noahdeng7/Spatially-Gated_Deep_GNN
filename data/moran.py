@@ -6,6 +6,17 @@ from esda.moran import Moran
 from spreg import OLS
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
+plt.rcParams.update({
+    "font.size": 19,
+    "axes.titlesize": 19,
+    "axes.labelsize": 19,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.fontsize": 16,
+    "figure.titlesize": 19,
+    "font.family": "serif",
+})
+
 x_train = pd.read_csv('data/X_train.csv')
 y_train = pd.read_csv('data/y_train.csv')
 df = pd.concat([x_train, y_train], axis=1)
@@ -157,8 +168,7 @@ ax.set_ylabel("Spatial Lag of Residuals")
 
 ax.set_title(
     f"Residual Moran Scatterplot\n"
-    f"Global Moran's I: {mi.I:.4f} (p: {mi.p_sim:.4f})",
-    fontsize=17,
+    f"Global Moran's I: {mi.I:.4f} (p: {mi.p_sim:.4f})"
 )
 
 plt.tight_layout()
@@ -204,7 +214,7 @@ map_df.plot(
         'fmt': "{:.2f}"
     },
     missing_kwds={
-        "color": "#e0e0e0" # Fills missing municipalities with light gray instead of white holes
+        "color": "#e0e0e0"
     },
     ax=ax
 )
@@ -213,7 +223,6 @@ ax.set_axis_off()
 ax.set_title(
     f"Total Out-Migration Flows by Source Municipality\n"
     f"Global Moran's I: {mi_flow.I:.4f} (p: {mi_flow.p_sim:.4f})",
-    fontsize=17,
     pad=15
 )
 
