@@ -1,18 +1,18 @@
 import argparse
 import os
-
-import geobr
 import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, GATConv
+from torch.nn.parallel import replicate, parallel_apply
 from libpysal.weights import KNN
-from scipy.stats import spearmanr
 from sklearn.preprocessing import StandardScaler
-from torch.nn.parallel import parallel_apply, replicate
-from torch_geometric.nn import GATConv, GCNConv
+from scipy.stats import spearmanr
 from tqdm import tqdm
+
+import geobr
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--name", type=str, required=True)
@@ -22,9 +22,6 @@ args = parser.parse_args()
 torch.manual_seed(42)
 np.random.seed(42)
 rng = np.random.default_rng(42)
-
-os.makedirs("data",    exist_ok=True)
-os.makedirs("the_gnn", exist_ok=True)
 
 log_file = open(f"the_gnn/info_{args.name}.txt", "w")
 def log(msg):
@@ -81,7 +78,7 @@ num_nodes   = len(city_codes)
 city_map_df = pl.DataFrame({"city_code": city_codes, "node_idx": list(range(num_nodes))})
 
 income_keywords  = ["gdp"]
-climate_keywords = ["_temp", "precipitation", "ndvi", "uv_", "humid",
+climate_keywords = ["_temp", "_precip", "ndvi", "uv",
                     "wind_mean", "wet_bulb", "degree_day"]
 income_idx  = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in income_keywords)]
 climate_idx = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in climate_keywords)]
@@ -102,8 +99,6 @@ X_infer_edge = edge_scaler.transform(X_inference.select(dyadic_cols).to_numpy().
 
 state_from_code = (all_nodes["city_code"] // 100000).to_numpy().astype(np.int64)
 
-# compute nodes have no internet: prefer the centroid cache written by
-# prep_centroids.py (run once on a login node), fall back to downloading.
 centroid_cache = "data/muni_centroids.csv"
 if os.path.exists(centroid_cache):
     cent = pl.read_csv(centroid_cache)
@@ -369,7 +364,6 @@ src_infer, dst_infer, ea_infer, y_infer = to_dev(src_infer, dst_infer, ea_infer,
 log("target: raw flow + Poisson NLL")
 
 neg_test  = sample_negatives(int(len(src_test)  * 0.3), rng, dev)
-neg_infer = sample_negatives(int(len(src_infer) * 0.3), rng, dev)
 
 def flow_loss(pred, target):
     return (pred - target * torch.log(pred + 1e-8)).mean()
@@ -387,10 +381,15 @@ def run_decode(model, h_src, h_dst, ea, src, dst):
     return model.decode(h_src[src], h_dst[dst], ea)
 
 def eval_split(model, h_src, h_dst, src, dst, ea, y_raw, neg):
-    sn, dn, ean, yn_raw = neg
-    pred = run_decode(model, h_src, h_dst, torch.cat([ea, ean]), torch.cat([src, sn]), torch.cat([dst, dn]))
-    loss = flow_loss(pred, torch.cat([y_raw, yn_raw])).item()
-    return loss, rmse(pred, torch.cat([y_raw, yn_raw])), cpc(pred, torch.cat([y_raw, yn_raw]))
+    if neg:
+        sn, dn, ean, yn_raw = neg
+        pred = run_decode(model, h_src, h_dst, torch.cat([ea, ean]), torch.cat([src, sn]), torch.cat([dst, dn]))
+        loss = flow_loss(pred, torch.cat([y_raw, yn_raw])).item()
+        return loss, rmse(pred, torch.cat([y_raw, yn_raw])), cpc(pred, torch.cat([y_raw, yn_raw]))
+    else:
+        pred = run_decode(model, h_src, h_dst, ea, src, dst)
+        loss = flow_loss(pred, y_raw).item()
+        return loss, rmse(pred, y_raw), cpc(pred, y_raw)
 
 ckpt_path      = f"the_gnn/best_sgdg_{args.name}.pt"
 best_infer_cpc = -1
@@ -404,9 +403,6 @@ for epoch in pbar:
 
     self_loss = 0.5 * (F.mse_loss(model.recon_self(h_src), x) + F.mse_loss(model.recon_self(h_dst), x))
     lag_loss  = 0.5 * (F.mse_loss(model.recon_lag(h_src),  Wx) + F.mse_loss(model.recon_lag(h_dst),  Wx))
-    # L1 on the effective FiLM multiplier |1+gamma| (and |beta| so signal can't
-    # leak back through the shift): open gates cost, so climate only passes
-    # where it buys prediction. gamma=0 is a fully open gate, gamma=-1 closed.
     gamma_s, beta_s = model.get_film_params(x, "src")
     gamma_d, beta_d = model.get_film_params(x, "dst")
     gate_open = 0.5 * ((1.0 + gamma_s).abs().mean() + (1.0 + gamma_d).abs().mean())
@@ -430,7 +426,7 @@ for epoch in pbar:
             h_src_eval = model.encode(x, adj_edge_index, "src")
             h_dst_eval = model.encode(x, adj_edge_index, "dst")
             _, _, tc = eval_split(model, h_src_eval, h_dst_eval, src_test,  dst_test,  ea_test,  y_test,  neg_test)
-            _, _, ic = eval_split(model, h_src_eval, h_dst_eval, src_infer, dst_infer, ea_infer, y_infer, neg_infer)
+            _, _, ic = eval_split(model, h_src_eval, h_dst_eval, src_infer, dst_infer, ea_infer, y_infer, None)
         log(f"epoch {epoch:4d}  test_CPC {tc:.4f}  infer_CPC {ic:.4f}")
         if ic > best_infer_cpc:
             best_infer_cpc = ic
@@ -554,7 +550,7 @@ if raw_income is not None:
         "high": src_test_income > q2,
     }
     group_masks = {k: torch.tensor(v, device=dev) for k, v in groups.items()}
-    for feat_name in ["wet_bulb_F", "UV_slope", "Precipitation", "mean_income_brl_2010"]:
+    for feat_name in ["wet_bulb_F", "temp", "precip", "ndvi", "wind_mean", "uv_log_mean_annual", "mean_income_brl"]:
         if feat_name not in feat_cols:
             continue
         fi = feat_cols.index(feat_name)
