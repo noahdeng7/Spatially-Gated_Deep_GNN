@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+
+# --- data artifacts: never versioned ----------------------------------------
+# The repo holds the PIPELINE, not its output. Derived datasets are large and
+# reproducible by running data-pipeline/ (see its README), so they stay local.
+#
+# This is not only a tidiness rule. GitHub enforces a hard 100 MB per-file limit
+# and rejects the whole push if any object exceeds it -- data/dyad_dataset*.csv
+# run to 506-784 MB each and made the push unrejectable-but-unsendable until
+# they were untracked.
+*.csv
+*.parquet
+*.pq
+*.feather
+*.npy
+*.npz
+*.pkl
+*.h5
+*.nc
+
+# EXCEPTION: the 2015->2020 municipality crosswalk is a pipeline INPUT, not an
+# output -- 5 KB, hand-verified against the INEGI catalogo, and that verification
+# work must not be lost. data-pipeline/.gitignore carries the same exception.
+!data-pipeline/data/raw/crosswalk_municipios_2015_2020.csv
+
+# --- model artifacts --------------------------------------------------------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
