@@ -1,0 +1,815 @@
+# =============================================================================
+# mx-migration : configuration
+# =============================================================================
+# Every path, vintage, filter and *material analytic choice* lives here.
+# Scripts read this file and never hardcode a decision that could change results.
+#
+# Flags marked [DECISION] correspond to a section in README.md that documents
+# the alternative and why the default was chosen.
+# =============================================================================
+
+project:
+  name: mx-migration
+  # Census round the panel is built for. Variable names in the INEGI microdata
+  # shift between rounds, so this gates the codebook lookup in 01_flows.py.
+  census_year: 2020
+  # The migration question is "where did you live 5 years ago", so the window
+  # opens in census_year - 5.
+  migration_window_years: 5
+
+paths:
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  logs: logs
+  reports: reports
+
+crs:
+  # Everything geographic is stored and joined in EPSG:4326. Distances are
+  # geodesic on the WGS84 ellipsoid, so we never project for distance.
+  storage: "EPSG:4326"
+  # Used ONLY for area computation (internal distance), where an equal-area
+  # projection is required. Mexico Albers equal-area conic.
+  equal_area: "ESRI:102008"
+
+# -----------------------------------------------------------------------------
+# 1. Migration flows
+# -----------------------------------------------------------------------------
+flows:
+  # ---------------------------------------------------------------------------
+  # [DECISION] Full count vs 10% sample -- SET TO FULL COUNT
+  # ---------------------------------------------------------------------------
+  # true  -> Cuestionario Basico (CB): complete enumeration of all inhabited
+  #          dwellings. Person table "Personas" (43 variables). NO expansion
+  #          factor, because there is nothing to expand.
+  # false -> Cuestionario Ampliado (CA): probability sample of ~4 million
+  #          dwellings. Person table "Personas_CA" (91 variables), carries
+  #          FACTOR.
+  #
+  # CONFIRMED against INEGI's study description (RNM catalog 632, 2026-07-21):
+  #   * the Basic Questionnaire was an "exhaustive enumeration of the population
+  #     and inhabited private dwellings throughout the country"
+  #   * "the microdata released from the Basic Questionnaire covers the entire
+  #     enumerated population"
+  #   * FACTOR appears ONLY in Viviendas_CA, Personas_CA and Migrantes -- the
+  #     sample tables. The CB tables have no weight variable.
+  # And the migration variables ENT_PAIS_RES_5A / MUN_RES_5A were confirmed
+  # present in the CB descriptor workbook.
+  #
+  # WHY THIS MATTERS FOR SPARSITY. The 10% sample manufactures zeros: a dyad
+  # with a true flow of 4 people has roughly a 66% chance of contributing no
+  # sampled records at all, and appears as a zero indistinguishable from a
+  # genuine one. Those are sampling artefacts, not structure. On the full count
+  # they become the positive flows they actually are, `migrants` becomes an
+  # actual headcount rather than a weighted estimate, and the structural /
+  # sampling zero distinction that 07_assemble.py can only guess at largely
+  # stops mattering.
+  #
+  # THE COST: the CB has 43 variables against the CA's 91. This pipeline uses
+  # ENT, MUN, EDAD, ENT_PAIS_RES_5A and MUN_RES_5A, all present in both. If you
+  # later want a CA-only covariate (migration cause, detailed education,
+  # disability), switch back -- nothing else in the pipeline changes.
+  # SET FALSE 2026-07-21: the full-count CB microdata is NOT publicly
+  # downloadable. INEGI's own microdatos page states the CB files offered are
+  # EXAMPLES ("no permiten hacer ningun tipo de inferencia") and the real full
+  # count is accessible only via the Laboratorio de microdatos / remote
+  # processing. The public instrument is the CA ~10% sample, downloaded as
+  # Censo2020_CA_eum_csv.zip (national scope, verified live 2026-07-21).
+  # FACTOR confirmed present in the real Personas header, so sample mode works
+  # as designed. If you later obtain the CB through the lab, flip this back.
+  use_basic_questionnaire: false
+
+  # Person-level file. Which one is read follows use_basic_questionnaire.
+  microdata_file: data/raw/censo2020/Personas.csv
+  microdata_file_sample: data/raw/censo2020/Personas_CA.csv
+  microdata_is_sharded: true
+  # Deliberately broad -- it matches BOTH instruments. 01_flows.py then splits
+  # them on the "_CA" filename marker and keeps only the one selected above,
+  # logging whatever it excluded. Filtering in code rather than in the glob
+  # means a directory holding both downloads works correctly and says so,
+  # instead of depending on a fiddly glob that (as an earlier version of this
+  # config proved) is easy to get subtly wrong.
+  microdata_glob: "data/raw/censo2020/**/Personas*.csv"
+
+  # --- Variable names -------------------------------------------------------
+  # CONFIRMED against INEGI's own descriptor workbook
+  # (Censo2020_CPV_CB_descriptor_bd_ejemplo.xlsx, parsed 2026-07-21):
+  # ENT, MUN, EDAD, ENT_PAIS_RES_5A and MUN_RES_5A all appear verbatim.
+  #
+  # FACTOR is the one NOT yet confirmed. The descriptor parsed was for the
+  # BASIC questionnaire (CB), which is a full enumeration and therefore carries
+  # no expansion factor. The expanded questionnaire (CA) is a sample and should
+  # carry one. 01_flows.py asserts every name below exists and prints the real
+  # header if not, so a wrong name fails loudly on the first read rather than
+  # producing a plausible empty panel.
+  vars:
+    # FACTOR is required ONLY when use_basic_questionnaire is false. In
+    # full-count mode 01_flows.py does not look for it and assigns every person
+    # record a weight of exactly 1.
+    factor: FACTOR              # CA only - CONFIRMED 2026-07-21 in the real
+                                # Personas00.CSV header of Censo2020_CA_eum_csv.zip
+    ent_current: ENT            # CONFIRMED - state of current residence
+    mun_current: MUN            # CONFIRMED - municipality of current residence
+    ent_res_5a: ENT_PAIS_RES_5A # CONFIRMED - state OR country of residence 2015
+    mun_res_5a: MUN_RES_5A      # CONFIRMED - municipality of residence 2015
+    age: EDAD                   # CONFIRMED - restricts to the at-risk population
+
+  # The 5-year migration question is only asked of people aged >= 5 at census
+  # date (younger people did not exist 5 years ago). Restricting avoids diluting
+  # the denominator. Set to null to disable.
+  min_age: 5
+
+  # --- Special codes --------------------------------------------------------
+  # [DECISION] Non-municipal origins are NOT dropped silently. They are routed
+  # to explicit categories, excluded from the dyadic panel, and counted in the
+  # reconciliation report (reports/flows_reconciliation.md).
+  #
+  # [TODO-VERIFY] Confirm these sentinel values in the codebook. INEGI encodes
+  # ENT_PAIS_RES_5A with values >32 for foreign countries and 999/998 style
+  # sentinels for non-specified; the exact widths vary by round.
+  special_codes:
+    # ENT_PAIS_RES_5A values that mean "same municipality / did not migrate".
+    # In 2020 the residence-5-years-ago fields are blank/coded for non-movers.
+    non_migrant_ent: ["00", "0"]
+    # Values indicating a foreign country of residence in 2015.
+    foreign_ent_min: 33          # any ENT_PAIS_RES_5A numeric >= this is a country
+    # "No especificado" sentinels, checked as strings after zero-padding.
+    not_specified_ent: ["99", "999"]
+    not_specified_mun: ["999", "998"]
+
+# -----------------------------------------------------------------------------
+# 2. Geometry and boundary harmonization
+# -----------------------------------------------------------------------------
+geometry:
+  # Municipal layer.
+  #
+  # CURRENTLY USING A FALLBACK. The official INEGI Marco Geoestadistico 2020
+  # download link is dead and the portal is JS-rendered, so the layer below was
+  # fetched from an INEGI/Esri ArcGIS Feature Service by src/fetch_mgn_arcgis.py.
+  #
+  # Two caveats, both handled but worth knowing:
+  #   * the service is labelled "(Prueba)" -- test, not a production product
+  #   * it is the DECEMBER 2022 vintage: 2,475 municipalities against the 2020
+  #     census's 2,469. The six post-census creations are folded back into their
+  #     parents by the crosswalk, which dissolves child into parent and
+  #     reconstructs the 2020 boundary. geo.assert_geometry_vintage() verifies
+  #     that the HARMONIZED universe matches the census before any raster pass.
+  #
+  # Switch back to data/raw/mgn2020/00mun.shp if you obtain the official file.
+  municipal_layer: data/raw/mgn2022/00mun.gpkg
+  cvegeo_field: CVEGEO          # 5-char: 2-digit state + 3-digit municipality
+  name_field: NOMGEO
+
+  # [DECISION] Municipalities created between 2015 and 2020 are AGGREGATED to
+  # their pre-split parent for BOTH origin and destination, so the panel is
+  # balanced and the row count is stable across the window. The alternative
+  # (allocating the child's flows to the parent by population share) is
+  # documented in README.md#boundary-harmonization.
+  crosswalk_strategy: aggregate_to_parent   # aggregate_to_parent | allocate | none
+  crosswalk_file: data/raw/crosswalk_municipios_2015_2020.csv
+
+# -----------------------------------------------------------------------------
+# 3. Population
+# -----------------------------------------------------------------------------
+population:
+  # Full-count municipal totals from the 2020 census tabulados (NOT the sample).
+  # ITER unpacks to <dest>/iter_00_cpv2020/conjunto_de_datos/. This is the
+  # locality-level file; 02_population.py collapses it to municipal totals
+  # by keeping only LOC == 0000 rows (see _collapse_locality_dimension).
+  census_2020_tabulado: data/raw/tabulados/iter_00_cpv2020/conjunto_de_datos/conjunto_de_datos_iter_00CSV20.csv
+  # CONAPO municipal projections, used for 2015 population.
+  conapo_projections: data/raw/conapo/proyecciones_municipales.csv
+
+  # [DECISION] Which vintage populates pop_orig.
+  #   2015 -> population at the START of the migration window (theoretically
+  #           correct: it is the at-risk stock that generated the flow)
+  #   2020 -> population at census date (simpler, matches pop_dest vintage)
+  # Both columns are always emitted (pop_orig_2015, pop_orig_2020); this flag
+  # only sets which one the canonical `pop_orig` aliases.
+  origin_pop_year: 2015          # 2015 | 2020
+  # Destination population is always 2020 (the stock that received the flow).
+  dest_pop_year: 2020
+
+# -----------------------------------------------------------------------------
+# 4. Distance
+# -----------------------------------------------------------------------------
+distance:
+  # WorldPop 2020 Mexico, 100m, UN-adjusted, constrained.
+  worldpop_raster: data/raw/worldpop/mex_ppp_2020_UNadj_constrained.tif
+  # Head-Mayer internal distance: 0.67 * sqrt(area / pi)
+  internal_distance_coefficient: 0.67
+  # Guard: population-weighted centroid must fall inside its own polygon.
+  # If it does not (concave / multipart municipalities), we report it and fall
+  # back to the representative point. Never silently.
+  centroid_containment_check: true
+  centroid_fallback: representative_point   # representative_point | keep | null
+
+# -----------------------------------------------------------------------------
+# 5. GDP per capita
+# -----------------------------------------------------------------------------
+gdp:
+  # [DECISION] Primary vs. fallback. Both are always computed and correlated;
+  # this flag only sets which one feeds the canonical gdppc_* columns.
+  source: censos_economicos       # censos_economicos | gridded
+
+  censos_economicos:
+    # INEGI Censos Economicos 2019, municipal gross value added (VACB).
+    file: data/raw/censos_economicos/ce2019_municipal.csv
+    year: 2019
+    # VERIFIED 2026-07-21: the extract is produced by src/fetch_ce2019_saic.py,
+    # which writes VA_BRUTO from SAIC variable A131A, "Valor agregado censal
+    # bruto (millones de pesos)" -- so the units are MILLIONS, not the miles
+    # de pesos a hand-made SAIC export would carry.
+    value_added_field: VA_BRUTO
+    units: millions_of_pesos
+
+  gridded:
+    # Kummu et al. (2025), "Downscaled gridded global dataset for GDP per capita
+    # at PPP over 1990-2022". Zenodo record 13943886.
+    product: kummu_2025           # kummu_2025 | kummu_2018 | wang_sun
+    raster: data/raw/gridded_gdp/rast_adm2_gdp_perCapita_1990_2022.tif
+    # Already in 2017 international dollars -- matches gdp.ppp.base_year, so no
+    # second currency conversion is applied to this source.
+    currency_base_year: 2017
+    # Matched to the Censos Economicos vintage so the two sources are compared
+    # on the same year rather than 4 years apart.
+    band_year: 2019
+    # Multi-band GeoTIFF, one band per year from 1990. Band index is
+    # 1-based: 2019 - 1990 + 1 = 30. If the correlation gate reports a
+    # suspiciously low r, check this index first -- an off-by-one here compares
+    # the wrong year and looks exactly like genuine disagreement.
+    band_index: 30
+    # Zonal aggregation to municipal polygons is population-weighted using the
+    # same WorldPop grid as the centroids.
+
+  # World Bank PPP conversion factor, GDP (LCU per international $), Mexico.
+  # Series PA.NUS.PPP, read from the API on 2026-07-21.
+  #   2015: 8.327595   2016: 8.446043   2017: 8.913552
+  #   2018: 9.276363   2019: 9.528366   2020: 9.814966
+  ppp:
+    conversion_factor: 8.913552   # PA.NUS.PPP, Mexico, 2017
+    base_year: 2017
+
+    # Deflator moving nominal pesos from the CE vintage to the PPP base year.
+    # Derived from World Bank NY.GDP.DEFL.ZS for Mexico (index, 2018 = 100):
+    #   2017: 95.0529682854956
+    #   2018: 99.9999999958638
+    #   2019: 104.319010231962
+    #
+    #   2019 -> 2017 : 95.0530 / 104.3190 = 0.911176   <-- set below
+    #   2018 -> 2017 : 95.0530 /  99.9999 = 0.950530
+    #
+    # [DECISION] Which one is correct depends on the CE reference year, which is
+    # NOT the same as the census year. Censos Economicos 2019 was collected in
+    # 2019 but reports the preceding fiscal year. If the extract turns out to
+    # report 2018 figures, switch to 0.950530. The two differ by ~4.3%, which
+    # shifts every GDP level by that much -- it does not affect the
+    # cross-source CORRELATION, so the gate in 04_gdp.py will not catch it.
+    # Verify it against the SAIC extract's own metadata.
+    #
+    # RESOLVED 2026-07-21: the reference year IS 2018. The SAIC API indexes
+    # the CE 2019 census under anios=[2018] (its year catalog runs
+    # 2003/2008/2013/2018/2023 -- reference years, one per quinquennial
+    # census), so the extract in data/raw/censos_economicos/ reports fiscal
+    # 2018 and the 2018->2017 deflator applies.
+    deflator_from_year_to_base: 0.950530
+
+    # Worked example of the full chain, so a reader can check the arithmetic:
+    #   1,000,000 nominal pesos of VA (2019)
+    #     x 0.911176            -> 911,176 pesos (2017)
+    #     / 8.913552            -> 102,223.66 international dollars (2017)
+
+  # [DECISION] Fill canonical gdppc from the OTHER source where the primary
+  # is missing (CE confidentiality suppression: Mainero, San Nicolas Tams.)
+  # or non-positive (censal VA <= 0, log undefined: 7 municipios). Rows are
+  # flagged in gdppc_source / src_gdppc_source / dst_gdppc_source. Enabled
+  # 2026-07-22 because a NaN-free panel was explicitly requested; the
+  # alternative -- dropping those municipalities and their real flows -- costs
+  # more than a flagged imputation. Set false to restore honest NAs.
+  fill_missing_from_gridded: true
+
+  # If the two sources correlate below this, 04_gdp.py HALTS and asks rather
+  # than silently picking one. Per your instruction.
+  #
+  # GATE FIRED 2026-07-21 on the first real build: r(logs)=0.5008,
+  # Spearman=0.4952, median CE/grid=0.0645, n=2,453. The checklist was worked
+  # before accepting:
+  #   1. Units -- correct (A131A is millones; ratio pattern is not a power of 10).
+  #   2. PPP/deflator -- cannot affect r.
+  #   3. Kummu coverage -- CHECKED, and it is NOT circular: sampling band 30 at
+  #      the 2,464 population-weighted centroids shows genuine within-state
+  #      variation (median 43 distinct values per state, ~1 per municipality
+  #      in most states; median within-state CV 0.32). See README.
+  #   4. Key alignment -- ruled out (5-char joins, zero orphans; misalignment
+  #      would push r toward 0, not 0.5).
+  # The residual disagreement is the DOCUMENTED difference in what the two
+  # measure: censal VA excludes informal/subsistence activity (poor rural
+  # municipios have CE/grid near 0.05) and books VA at establishment location.
+  # Decision: keep gdp.source=censos_economicos (direct measurement, known
+  # bias) with the gridded columns shipped alongside. Threshold lowered to
+  # sit just under the observed r so a FUTURE regression still halts.
+  min_cross_source_correlation: 0.45
+
+# -----------------------------------------------------------------------------
+# 6. Climate
+# -----------------------------------------------------------------------------
+climate:
+  # [DECISION] Which normals product. WorldClim v2.1 is the default because its
+  # 30-arcsec grid is the most widely used in the gravity literature and is
+  # directly comparable across studies. CHELSA v2.1 has better orographic
+  # downscaling for mountainous terrain (relevant for Mexico's sierras) but is
+  # less standard. TerraClimate is coarser (4km) but covers a period adjacent to
+  # the migration window rather than 1970-2000.
+  source: worldclim               # worldclim | chelsa | terraclimate
+
+  # [DECISION] Which climate table 07_assemble.py feeds into the panel. This is
+  # SEPARATE from `source` above (which only selects the WorldClim/CHELSA product
+  # 05_climate.py builds). Two providers:
+  #   worldclim_zonal -> interim/climate.parquet from 05_climate.py. Population-
+  #                      weighted zonal mean of the `source` product's long-run
+  #                      normals (1970-2000 for WorldClim). degC / mm.
+  #   era5_gee        -> interim/climate_gee.parquet from src/climate_loader.py.
+  #                      ERA5-Land daily reanalysis, 2016-2020 mean, reduced to
+  #                      municipal polygons server-side on Google Earth Engine as
+  #                      a POPULATION-WEIGHTED mean (weights: WorldPop/GP/100m/pop
+  #                      2020, the same grid behind the centroids in 03_distance).
+  #                      This is WINDOW climate (conditions during the migration
+  #                      window) rather than a long-run normal. Native degF / m,
+  #                      converted to degC / mm at assembly.
+  # Set to era5_gee to build the panel from the ERA5 window climate; the Makefile
+  # variable CLIMATE_TABLE must agree (it defaults to the era5_gee output).
+  panel_source: era5_gee          # worldclim_zonal | era5_gee
+
+  worldclim:
+    version: "2.1"
+    resolution: "30s"
+    tmean_dir: data/raw/worldclim/wc2.1_30s_tavg   # 12 monthly GeoTIFFs
+    prec_dir:  data/raw/worldclim/wc2.1_30s_prec   # 12 monthly GeoTIFFs
+    period: "1970-2000"
+
+  chelsa:
+    version: "2.1"
+    tmean_dir: data/raw/chelsa/tas
+    prec_dir:  data/raw/chelsa/pr
+    period: "1981-2010"
+    # CHELSA v2.1 ships scaled integers. tas: value*0.1 - 273.15 -> degC
+    tmean_scale: 0.1
+    tmean_offset: -273.15
+    prec_scale: 0.01
+
+  terraclimate:
+    tmax_file: data/raw/terraclimate/TerraClimate_tmax.nc
+    tmin_file: data/raw/terraclimate/TerraClimate_tmin.nc
+    prec_file: data/raw/terraclimate/TerraClimate_ppt.nc
+    period: [2010, 2020]
+
+  # [DECISION] Regridding direction. We aggregate the FINER grid (WorldPop 100m)
+  # UP to the COARSER climate grid rather than resampling climate down. Resampling
+  # climate to 100m would invent spatial precision the source does not have.
+  regrid_direction: pop_to_climate   # pop_to_climate | climate_to_pop
+  # Assert the population-weighted mean lies within [min, max] of contributing
+  # cells. A weighted mean outside that range means a weighting or masking bug.
+  assert_weighted_mean_in_range: true
+
+# -----------------------------------------------------------------------------
+# 6b. Household income (ICMM)
+# -----------------------------------------------------------------------------
+income:
+  # INEGI ICMM -- Ingreso Corriente para los Municipios de Mexico, 2020.
+  # The MEAN current quarterly income per household for each municipality,
+  # produced by SMALL-AREA ESTIMATION from the ENIGH 2020 (nueva serie) plus the
+  # 2020 Census and administrative records. It is a MODELLED estimate, not a
+  # direct measurement (the census does not ask household income), and it is a
+  # MEAN -- INEGI does not publish a municipal median. Released October 2023.
+  #
+  # File is long-format keyed by (ent, mun, est): est 1=Valor, 2=Error estandar,
+  # 3=Limite inferior, 4=Limite superior, 5=Coeficiente de variacion (%).
+  # icpth = "Ingreso Corriente Promedio Trimestral por Hogar 2020" in current
+  # (nominal 2020) pesos, per quarter. 08_income.py pivots est to columns.
+  file: data/raw/icmm/conjunto_de_datos/conjunto_de_datos_icmm_2020.csv
+
+  # Values as published are QUARTERLY nominal 2020 pesos per household. Kept in
+  # native units -- no PPP conversion (unlike gdp, which the literature wants in
+  # int$; income here is a descriptive covariate best left in the units INEGI
+  # published, and mixing a 2020-nominal income with a 2017-int$ GDP under one
+  # PPP factor would be misleading). A user wanting annual pesos multiplies by 4.
+
+  # [DECISION] Folding a post-2015 split child into its parent. Household income
+  # is an INTENSIVE per-household quantity, so a child's value cannot be SUMMED
+  # into its parent the way an extensive count (population, value added) is. The
+  # pre-split parent's mean is the household-count-weighted average of the two
+  # 2020 municipalities' means. Households are not in the ICMM file, so 2020
+  # POPULATION is used as the weight (a good proxy; the only error is a
+  # difference in mean household size between parent and child). This affects
+  # exactly ONE municipality in the 2020 vintage: 23005 Benito Juarez, which
+  # absorbs 23011 Puerto Morelos. Folded municipalities are flagged
+  # `icmm_2020_harmonized` in hh_income_source, and their published uncertainty
+  # columns (se/ci/cv) are set NA -- a weighted mean of two SAE point estimates
+  # does not carry a clean combined standard error.
+  harmonize_weight: population    # population | none
+
+  # INEGI reliability convention for CV (%): <15 reliable, 15-30 use with
+  # caution, >30 not recommended. In the 2020 vintage every municipal CV is
+  # below 9%, so nothing is flagged -- but the threshold is kept configurable so
+  # a future vintage with noisier estimates surfaces them in the report.
+  cv_caution_threshold: 15
+  cv_unreliable_threshold: 30
+
+# -----------------------------------------------------------------------------
+# 7. Demography (youth share)
+# -----------------------------------------------------------------------------
+demography:
+  # Municipal age distribution from the 2020 census. Prefer the full-count
+  # tabulado; fall back to the weighted microdata if unavailable.
+  # ITER carries only BANDED age counts (P_0A2, P_15YMAS, ...), which cannot
+  # honour arbitrary config age bands. 06_demography.py detects this and
+  # falls back to the microdata automatically.
+  age_tabulado: data/raw/tabulados/iter_00_cpv2020/conjunto_de_datos/conjunto_de_datos_iter_00CSV20.csv
+  use_microdata_fallback: true
+
+  # [DECISION] Age bands are config, not hardcoded, because the literature is
+  # not settled: 15-29/15-64 (UN youth), 15-24/15-64 (ILO), 20-34/15-64 (peak
+  # migration propensity). Changing these changes dempres_orig materially.
+  youth_min_age: 15
+  youth_max_age: 29
+  working_min_age: 15
+  working_max_age: 64
+
+# -----------------------------------------------------------------------------
+# 8. Assembly
+# -----------------------------------------------------------------------------
+assemble:
+  # Full cartesian product of municipalities, zeros explicitly present.
+  # PPML gravity estimation needs the zeros; dropping them is a silent and
+  # consequential choice. ~2470^2 ~= 6.1M rows.
+  include_zero_flows: true
+  # Exclude the diagonal (origin == destination) from the main panel. The
+  # diagonal is written separately to interim/flows_diagonal.parquet.
+  include_diagonal: false
+  output: data/processed/mx_dyadic.parquet
+  codebook: data/processed/mx_dyadic_codebook.md
+  compression: zstd
+
+  # ---------------------------------------------------------------------------
+  # [DECISION] Positive-flow-only companion export
+  # ---------------------------------------------------------------------------
+  # Writes an ADDITIONAL file containing only dyads with migrants > 0, as CSV.
+  # The full panel above is unaffected -- this is a view, not a replacement.
+  #
+  # Useful for inspection, sharing, mapping, and any tool that chokes on 6.1M
+  # rows. NOT suitable for gravity estimation; see the warning below.
+  export_positive_only: true
+  positive_only_output: data/processed/mx_dyadic_positive.csv
+  # Gzip the CSV. A positive-only CSV is roughly 40-80 MB raw depending on how
+  # many cells are populated; null or false writes it uncompressed.
+  positive_only_gzip: false
+
+  # ---------------------------------------------------------------------------
+  # [DECISION -- READ BEFORE SETTING TRUE] Drop zeros from the MAIN panel
+  # ---------------------------------------------------------------------------
+  # true  -> mx_dyadic.parquet itself contains only positive flows
+  # false -> mx_dyadic.parquet keeps the full cartesian product (default)
+  #
+  # Setting this true conditions the dataset on the dependent variable being
+  # positive. For gravity estimation that is selection on the outcome: the
+  # distance elasticity is biased toward zero by an amount that depends on how
+  # many cells were dropped, and roughly 99% of cells are dropped here. PPML
+  # exists precisely to use the zeros; a positive-only panel cannot be estimated
+  # by PPML in any meaningful sense.
+  #
+  # There are legitimate reasons to want it anyway -- descriptive work, network
+  # analysis, a flows map, a shareable file. Those are all better served by the
+  # positive-only EXPORT above, which costs you nothing.
+  #
+  # 07_assemble.py logs a prominent warning and stamps the choice into the
+  # codebook whenever this is true, so a downstream reader cannot mistake a
+  # filtered panel for a complete one.
+  drop_zero_flows_from_main_panel: false
+
+  # NOTE ON "STRUCTURAL" ZEROS. There is deliberately NO option to drop only the
+  # structural zeros. `zero_class` is a documented heuristic, not an identified
+  # quantity: with a single 10% cross-section, structural zeros (no flow is
+  # possible) and sampling zeros (a flow exists but the sample missed it) are not
+  # separately identifiable. A true flow of 4 people has a ~66% chance of
+  # contributing zero sampled records. Filtering on that heuristic would delete
+  # real flows while presenting the result as a principled cleanup, which is
+  # worse than either keeping all the zeros or dropping all of them.
+
+validation:
+  # Reconcile total weighted migrants against INEGI's published tabulado.
+  # Set to the published national 5-year internal migrant count to enable.
+  published_internal_migrants_2015_2020: null   # [TODO-VERIFY]
+  # Fail the build if the discrepancy exceeds this fraction. null = report only.
+  max_reconciliation_discrepancy: 0.05
+  # Orphan CVEGEOs (in flows, absent from geometry) are ALWAYS reported.
+  # Fail the build if any are found, rather than inner-joining them away.
+  fail_on_orphans: true
+
+logging:
+  level: INFO
+  # Every step logs rows in / rows out to this file and to stdout.
+  build_log: logs/build.log
+
+# -----------------------------------------------------------------------------
+# Download manifest
+# -----------------------------------------------------------------------------
+# Each entry:
+#   url        : direct download link (null = must be obtained interactively)
+#   dest       : path under data/raw/
+#   sha256     : optional integrity check; null to skip
+#   unpack     : zip | gz | rar | none
+#   confidence : VERIFIED | INFERRED | MANUAL   <-- read this before trusting it
+#   todo       : what to do, for MANUAL and INFERRED entries
+#
+# CONFIDENCE TIERS -- these are not decoration, they say how much to trust the URL:
+#
+#   VERIFIED  The URL or its containing directory was fetched and confirmed to
+#             exist during research. Safe to run.
+#
+#   INFERRED  Built from a documented naming convention plus a confirmed sibling
+#             file in the same directory, but the exact URL was NOT fetched.
+#             It may 404. It will not silently return the wrong file -- INEGI
+#             404s rather than redirecting -- so a failure here is loud.
+#
+#   MANUAL    No stable direct URL exists. The source is behind an interactive
+#             export tool or a browser-only bucket UI. A human must fetch it.
+#             00_download.py prints the instructions and exits non-zero.
+# -----------------------------------------------------------------------------
+downloads:
+
+  census_microdata:
+    # MANUAL. An inferred URL was constructed and TESTED, and it does not work.
+    #
+    #   tried: .../ccpv/2020/microdatos/Censo2020_CA_nal_csv.zip
+    #   got:   HTTP 200, text/html, 1428 bytes, "Esta liga ya no existe"
+    #
+    # READ THAT AGAIN: INEGI serves missing files with status 200 and an HTML
+    # "page not found" body. requests.raise_for_status() does not catch it.
+    # 00_download.py now guards against this (_check_content_type), but the
+    # lesson generalises -- do not trust an INEGI URL you have not fetched.
+    url: null
+    dest: data/raw/censo2020/
+    sha256: null
+    unpack: zip
+    confidence: MANUAL
+    todo: >
+      Browse https://www.inegi.org.mx/programas/ccpv/2020/?ps=microdatos and copy
+      the real link. The page is JS-rendered, so it cannot be scraped and the
+      link could not be recovered programmatically.
+      WHAT TO PICK: the "Cuestionario Ampliado" (CA) microdata, CSV format. INEGI
+      names these archives Censo2020_CA_<scope>_<format>.ZIP. Take the national
+      scope if offered, else all 32 states and set flows.microdata_is_sharded
+      true (it already is).
+      ALSO TAKE the CA descriptor / diccionario de datos, and confirm FACTOR
+      exists in Personas_CA -- it is the one variable in flows.vars not yet
+      confirmed. See the note there, and the note on flows.use_basic_questionnaire,
+      which may let you avoid the sample entirely.
+
+  icmm_2020:
+    # VERIFIED 2026-07-23. INEGI ICMM 2020 open-data package. Probed directly:
+    # this exact URL returned a real zip (application/x-zip-comp); the sibling
+    # paths under /programas/enigh/nc/2020/ and the *_csv.zip name variants all
+    # returned INEGI's 200/text/html "Esta liga ya no existe" soft-404. The data
+    # is NOT under the ENIGH program tree -- it lives under /investigacion/icmm/.
+    # The zip contains conjunto_de_datos/, catalogos/, diccionario_de_datos/,
+    # metadatos/ (INEGI datos-abiertos layout).
+    url: https://www.inegi.org.mx/contenidos/investigacion/icmm/datosabiertos/conjunto_de_datos_icmm_2020_csv.zip
+    dest: data/raw/icmm/
+    sha256: null
+    unpack: zip
+    confidence: VERIFIED
+    todo: >
+      Feeds income.file (conjunto_de_datos/conjunto_de_datos_icmm_2020.csv).
+      Long format: (ent, mun, est) with est 1=Valor 2=Error estandar 3=Limite
+      inferior 4=Limite superior 5=CV(%), and icpth = mean quarterly household
+      income in nominal 2020 pesos. 08_income.py drops mun==000 aggregates,
+      pivots est to columns, and folds post-2015 split children into parents by
+      a population-weighted mean. Landing page inegi.org.mx/investigacion/icmm/;
+      methodology at .../programas/enigh/nc/2020/doc/icmm_2020_advertencia.pdf.
+
+  marco_geoestadistico:
+    # MANUAL. The widely-cited direct link is DEAD as of 2026-07-21. Tested
+    # three variants (with/without www, with/without the double slash that
+    # appears in the published form) -- all return the same 200/text/html
+    # "Esta liga ya no existe" page. INEGI reorganised its /productos/prod_serv/
+    # tree; /contenidos/programas/ paths still work, which is why the ITER
+    # download below is fine.
+    url: null
+    dest: data/raw/mgn2020/
+    sha256: null
+    unpack: zip
+    confidence: MANUAL
+    todo: >
+      Browse https://www.inegi.org.mx/programas/mg/ and take the 2020 (Censo de
+      Poblacion y Vivienda 2020) edition, integrated national product
+      (~2.65 GB). The library record is upc=889463807469 if you need to confirm
+      you have the right edition.
+      Then set geometry.municipal_layer to the municipal layer inside it
+      (expected 00mun.shp) and confirm it carries CVEGEO as a 5-char string
+      rather than split integer CVE_ENT/CVE_MUN fields. geo.load_municipios()
+      handles both but logs which one it used.
+      SMALLER ALTERNATIVE: if you only need municipal polygons and not the AGEB
+      and manzana layers, look for a municipal-only distribution rather than the
+      full integrated 2.65 GB archive.
+
+  tabulado_poblacion:
+    # VERIFIED. ITER = Principales resultados por localidad, the FULL COUNT
+    # open-data product. Contains municipal rows with POBTOT plus banded age
+    # counts. Inner file: conjunto_de_datos_iter_00CSV20.csv
+    url: https://www.inegi.org.mx/contenidos/programas/ccpv/2020/datosabiertos/iter/iter_00_cpv2020_csv.zip
+    dest: data/raw/tabulados/
+    sha256: null
+    unpack: zip
+    confidence: VERIFIED
+    todo: >
+      ITER covers population totals and BANDED age counts, so it serves
+      population.census_2020_tabulado and (partly) demography.age_tabulado.
+      06_demography.py detects banded age automatically and falls back to the
+      microdata, because arbitrary config age bands cannot be honoured from
+      pre-banded counts.
+      STILL MISSING: the published internal-migration tabulado needed for
+      validation.published_internal_migrants_2015_2020. See that key.
+
+  conapo_projections:
+    # MANUAL. The published direct link 404s (genuinely, with a real 404 this
+    # time -- CONAPO is better behaved than INEGI here), and the agency's newer
+    # domain conapo.segob.gob.mx currently fails TLS certificate verification.
+    # Tested 2026-07-21:
+    #   http://www.conapo.gob.mx/.../base_municipios_final_datos_02.rar  -> 404
+    #   https://conapo.segob.gob.mx/...                                  -> SSLError
+    url: null
+    dest: data/raw/conapo/
+    sha256: null
+    unpack: rar
+    confidence: MANUAL
+    todo: >
+      Browse https://www.gob.mx/conapo -> Datos Abiertos, or the CONAPO article
+      "Reconstruccion y proyecciones de la poblacion de los municipios de
+      Mexico". Take the MUNICIPAL series.
+      THREE CAVEATS, all material.
+      (1) Use the 2018-base municipal series. CONAPO's newer 2023-base
+      projections are published only at STATE level and cannot substitute for a
+      municipal panel.
+      (2) The file ships as .rar. 00_download.py shells out to unar/7z/unrar if
+      one is on PATH and otherwise tells you to extract by hand -- it will not
+      silently leave an unextracted archive.
+      (3) If the site still fails TLS verification, fetch it in a browser rather
+      than disabling certificate checking in the pipeline.
+      The file is a long panel (municipality x year x sex); 02_population.py
+      filters to the window-start year and sums across the sex dimension.
+      FALLBACK IF CONAPO PROVES UNOBTAINABLE: set population.origin_pop_year to
+      2020 and use census population at both ends. That reintroduces the
+      depletion endogeneity documented in README.md -- it is a real cost, not a
+      free substitution, so say so in your write-up if you do it.
+
+  worldpop_2020:
+    # VERIFIED. Directory index fetched; this exact filename is present (27 MB).
+    # CONSTRAINED (not unconstrained) is deliberate: the constrained product
+    # masks uninhabited cells, which is the whole point for the sparse northern
+    # municipalities that population-weighted centroids exist to fix.
+    url: https://worldpop-public-data.soton.ac.uk/GIS/Population/Global_2000_2020_Constrained/2020/BSGM/MEX/mex_ppp_2020_UNadj_constrained.tif
+    dest: data/raw/worldpop/mex_ppp_2020_UNadj_constrained.tif
+    sha256: null
+    unpack: none
+    confidence: VERIFIED
+
+  worldclim_tavg:
+    # VERIFIED. Listed on worldclim.org as the 30s tavg archive. 12 GeoTIFFs.
+    # NOTE the dest is a SEPARATE directory from prec. The archives unpack to
+    # flat files (wc2.1_30s_tavg_01.tif ...), so extracting both into one
+    # directory would give 05_climate.py 24 rasters where it requires exactly
+    # 12 -- and it would fail rather than silently average the wrong thing,
+    # but a failed build is still a wasted 5 GB download.
+    url: https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_30s_tavg.zip
+    dest: data/raw/worldclim/wc2.1_30s_tavg/
+    sha256: null
+    unpack: zip
+    confidence: VERIFIED
+
+  worldclim_prec:
+    # VERIFIED. Companion 30s precipitation archive. 12 GeoTIFFs.
+    url: https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_30s_prec.zip
+    dest: data/raw/worldclim/wc2.1_30s_prec/
+    sha256: null
+    unpack: zip
+    confidence: VERIFIED
+
+  chelsa:
+    # MANUAL. CHELSA v2.1 is distributed through a browser-based cloud bucket
+    # UI (envicloud). A direct per-file URL pattern exists but could not be
+    # confirmed, and guessing it risks silently fetching a different version --
+    # exactly the failure mode this manifest refuses to court.
+    url: null
+    dest: data/raw/chelsa/
+    sha256: null
+    unpack: none
+    confidence: MANUAL
+    todo: >
+      Only needed if climate.source == chelsa (default is worldclim, which is
+      fully automated -- prefer it unless you specifically want CHELSA's
+      orographic downscaling in the sierras).
+      Browse: https://envicloud.wsl.ch/#/?bucket=https://os.unil.cloud.switch.ch/chelsa02/&prefix=chelsa/global/climatologies/
+      Fetch the 1981-2010 monthly climatologies for tas and pr (12 files each)
+      into data/raw/chelsa/tas and data/raw/chelsa/pr.
+      CRITICAL: verify the scaling. CHELSA v2.1 ships scaled integers and the
+      configured values (tmean_scale 0.1, offset -273.15, prec_scale 0.01)
+      assume K*10 and mm*100. If those are wrong the temperatures come out
+      absurd -- 05_climate.py reports out-of-range values rather than clipping
+      them, so a scaling error is loud, not silent.
+
+  terraclimate:
+    # MANUAL (pattern VERIFIED). The THREDDS fileServer pattern is confirmed:
+    #   http://thredds.northwestknowledge.net:8080/thredds/fileServer/TERRACLIMATE_ALL/data/TerraClimate_<var>_<year>.nc
+    # Left null because it is one file per variable per year -- 33 files for
+    # tmax+tmin+ppt over 2010-2020 -- which this single-URL manifest cannot
+    # express.
+    url: null
+    dest: data/raw/terraclimate/
+    sha256: null
+    unpack: none
+    confidence: MANUAL
+    todo: >
+      Only needed if climate.source == terraclimate (which is also not yet
+      implemented in 05_climate.py -- it raises with instructions).
+      Loop the verified pattern above over var in {tmax, tmin, ppt} and year in
+      2010..2020. Note TerraClimate publishes no tmean band; mean temperature
+      must be derived as (tmax+tmin)/2.
+
+  censos_economicos:
+    # MANUAL. SAIC is an interactive query tool. There is no stable direct URL
+    # for a municipal VACB extract -- the export is generated per query.
+    url: null
+    dest: data/raw/censos_economicos/
+    sha256: null
+    unpack: none
+    confidence: MANUAL
+    todo: >
+      Go to https://www.inegi.org.mx/app/saic/ and switch the census year to
+      2019 (the tool now defaults to Censos Economicos 2024 -- 2019 is still the
+      right vintage here because it is closer to the 2015-2020 migration window).
+      Select: geographic scope = all municipalities; activity = total (all
+      sectors); variable = valor agregado censal bruto (VACB). Use the
+      "Descarga masiva" icon to export CSV into data/raw/censos_economicos/,
+      then set gdp.censos_economicos.file to the exported filename.
+      THEN CONFIRM TWO THINGS, both of which change the numbers:
+        (a) the units -- CE tables are normally miles de pesos; set
+            gdp.censos_economicos.units to match.
+        (b) the REFERENCE year. Censos Economicos 2019 was collected in 2019 but
+            reports the preceding fiscal year. If the reference year is 2018,
+            change gdp.ppp.deflator_from_year_to_base to the 2018 value given in
+            the comment on that key.
+
+  gridded_gdp:
+    # VERIFIED. Kummu et al. downscaled gridded GDP per capita, 1990-2022,
+    # Zenodo record 13943886. This is the NEWER release, chosen over the 2018
+    # Dryad version for two concrete reasons:
+    #   * it is already in 2017 international dollars, matching gdp.ppp.base_year
+    #     exactly (the 2018 Dryad release is in 2011 int$ and would need a
+    #     second conversion)
+    #   * it resolves to admin-2, which for Mexico IS the municipality
+    url: https://zenodo.org/records/13943886/files/rast_adm2_gdp_perCapita_1990_2022.tif?download=1
+    dest: data/raw/gridded_gdp/rast_adm2_gdp_perCapita_1990_2022.tif
+    sha256: null
+    unpack: none
+    confidence: VERIFIED
+    todo: >
+      READ THIS BEFORE TRUSTING THE CROSS-CHECK. This product is DOWNSCALED from
+      administrative accounts, not independently measured. If Mexico's admin-2
+      values derive from Mexican subnational sources, it is a genuine second
+      measurement of municipal GDP and the correlation gate in 04_gdp.py is
+      meaningful. If Mexico's municipal values were instead interpolated from
+      state totals, then within-state variation is an artefact of the
+      downscaling key and the "cross-check" is largely circular -- it would
+      agree with itself, not validate INEGI.
+      The paper lists 89 countries with subnational admin data; confirm Mexico
+      is among them at admin-2 before reporting the correlation as validation.
+      Alternative also available at the same record: tabulated_adm2_gdp_perCapita.csv,
+      which skips zonal statistics entirely but needs a GADM->CVEGEO crosswalk
+      of its own -- a second boundary-matching problem, which is why the raster
+      route (keyed on our own polygons) is the default.
+
+  worldbank_ppp:
+    # VERIFIED. Values already read off and written into gdp.ppp below, so this
+    # download is optional -- keep it for provenance and reproducibility.
+    url: https://api.worldbank.org/v2/country/MEX/indicator/PA.NUS.PPP?format=json&date=2010:2022&per_page=100
+    dest: data/raw/worldbank/mex_ppp_conversion_factor.json
+    sha256: null
+    unpack: none
+    confidence: VERIFIED
+
+  worldbank_deflator:
+    # VERIFIED. GDP deflator for Mexico, used to move nominal pesos from the
+    # Censos Economicos vintage to the PPP base year. Index base is 2018 = 100.
+    url: https://api.worldbank.org/v2/country/MEX/indicator/NY.GDP.DEFL.ZS?format=json&date=2010:2022&per_page=100
+    dest: data/raw/worldbank/mex_gdp_deflator.json
+    sha256: null
+    unpack: none
+    confidence: VERIFIED
+    todo: >
+      The World Bank GDP deflator is used here rather than INEGI's INPC because
+      it is API-accessible and therefore reproducible without a manual step.
+      They are not the same index: INPC is consumer prices, the GDP deflator
+      covers all domestic production and is the more appropriate deflator for a
+      value-added series. If you prefer INPC for comparability with Mexican
+      sources, substitute it and say so -- the ratio is what matters, and both
+      are defensible.

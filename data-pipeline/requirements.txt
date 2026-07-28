@@ -1,0 +1,36 @@
+# mx-migration : pinned dependencies
+# Python 3.11-3.13. Tested on 3.13.
+#
+# Install:
+#   python -m venv .venv
+#   .venv/Scripts/activate      (Windows)   |   source .venv/bin/activate  (POSIX)
+#   pip install -r requirements.txt
+
+# --- core tabular ---
+numpy==2.1.3
+pandas==2.2.3
+polars==1.17.1
+pyarrow==18.1.0
+
+# --- geospatial vector ---
+geopandas==1.0.1
+shapely==2.0.6
+pyproj==3.7.0
+fiona==1.10.1
+
+# --- geospatial raster ---
+rasterio==1.4.3
+rioxarray==0.18.1
+xarray==2024.11.0
+netCDF4==1.7.2
+
+# --- distance ---
+geopy==2.4.1
+
+# --- config / io / cli ---
+PyYAML==6.0.2
+requests==2.32.3
+tqdm==4.67.1
+
+# --- testing ---
+pytest==8.3.4

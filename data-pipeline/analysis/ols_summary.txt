@@ -1,0 +1,68 @@
+REGRESSION RESULTS
+------------------
+
+SUMMARY OF OUTPUT: ORDINARY LEAST SQUARES
+------------------------------------------------------------------------------------
+Data set            :     unknown
+Weights matrix      :     unknown
+Dependent Variable  :    log_flow                Number of Observations:        1958
+Mean dependent var  :      5.8002                Number of Variables   :          14
+S.D. dependent var  :      1.8564                Degrees of Freedom    :        1944
+R-squared           :      0.5439
+Adjusted R-squared  :      0.5408
+Sum squared residual:     3076.32                F-statistic           :    178.2981
+Sigma-square        :       1.582                Prob(F-statistic)     :  1.476e-319
+S.E. of regression  :       1.258                Log likelihood        :   -3220.605
+Sigma-square ML     :       1.571                Akaike info criterion :    6469.211
+S.E of regression ML:      1.2535                Schwarz criterion     :    6547.326
+
+------------------------------------------------------------------------------------
+            Variable     Coefficient       Std.Error     t-Statistic     Probability
+------------------------------------------------------------------------------------
+            CONSTANT         4.14330         0.67606         6.12856         0.00000
+             src_pop         0.00001         0.00000        26.82095         0.00000
+             dst_pop         0.00001         0.00000        16.70689         0.00000
+    dist_geodesic_km         0.00148         0.00015         9.56472         0.00000
+           src_gdppc         0.00004         0.00001         6.36933         0.00000
+        src_gdppc_sq        -0.00000         0.00000        -5.11605         0.00000
+           dst_gdppc         0.00005         0.00001         3.62015         0.00030
+        dst_gdppc_sq        -0.00000         0.00000        -2.52540         0.01164
+            src_temp         0.07393         0.01284         5.75589         0.00000
+          src_precip        -0.00002         0.00008        -0.27853         0.78063
+            dst_temp        -0.12019         0.02122        -5.66327         0.00000
+          dst_precip         0.00035         0.00017         2.09812         0.03602
+         src_dempres         5.15512         0.78525         6.56494         0.00000
+         dst_dempres        -3.43501         1.83424        -1.87271         0.06126
+------------------------------------------------------------------------------------
+
+REGRESSION DIAGNOSTICS
+MULTICOLLINEARITY CONDITION NUMBER          98.861
+
+TEST ON NORMALITY OF ERRORS
+TEST                             DF        VALUE           PROB
+Jarque-Bera                       2        700.753           0.0000
+
+DIAGNOSTICS FOR HETEROSKEDASTICITY
+RANDOM COEFFICIENTS
+TEST                             DF        VALUE           PROB
+Breusch-Pagan test               13       1567.233           0.0000
+Koenker-Bassett test             13        730.461           0.0000
+
+DIAGNOSTICS FOR SPATIAL DEPENDENCE
+- SARERR -
+TEST                           MI/DF       VALUE           PROB
+Moran's I (error)              0.3055       23.226           0.0000
+Lagrange Multiplier (lag)         1        587.082           0.0000
+Robust LM (lag)                   1        132.496           0.0000
+Lagrange Multiplier (error)       1        520.434           0.0000
+Robust LM (error)                 1         65.849           0.0000
+Lagrange Multiplier (SARMA)       2        652.931           0.0000
+
+- Spatial Durbin -
+TEST                              DF       VALUE           PROB
+LM test for WX                   13        268.167           0.0000
+Robust LM WX test                13        201.519           0.0000
+Lagrange Multiplier (lag)         1        587.082           0.0000
+Robust LM Lag - SDM               1        520.434           0.0000
+Joint test for SDM               14        788.601           0.0000
+================================ END OF REPORT =====================================

@@ -1,0 +1,32 @@
+# --- data ------------------------------------------------------------------
+# Raw downloads are large and are reproducible from config.yaml -> downloads.
+# They are never edited, so there is nothing in them worth versioning.
+data/raw/*
+!data/raw/.gitkeep
+
+# EXCEPTION: the boundary crosswalk IS versioned. It lives in raw/ because it is
+# an input, but it is the one file a human is expected to edit (verifying CVEGEO
+# codes against the INEGI catalogo), and that verification work must not be lost.
+!data/raw/crosswalk_municipios_2015_2020.csv
+
+# Derived data: reproducible from raw/ by `make all`.
+data/interim/
+data/processed/
+
+# --- generated -------------------------------------------------------------
+logs/
+reports/
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# --- editors / os ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
