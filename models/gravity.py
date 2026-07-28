@@ -1,13 +1,48 @@
+"""
+PPML gravity baseline for the Mexican municipality-to-municipality migration
+panel.
+
+A Poisson GLM of migrant counts on log origin population, log destination
+population and log distance -- the standard gravity specification, estimated by
+pseudo-maximum-likelihood so that zeros are admissible.
+
+Inputs are the splits written by `models/make_splits.py`.
+"""
+
+import argparse
 import sys
 import time
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import statsmodels.api as sm
 import joblib
 from sklearn.metrics import mean_squared_error, r2_score
 
-sys.stdout = open("simple_gravity/baseline_gravity.txt", "w", buffering=1)
-sys.stderr = sys.stdout
+# Repo root = parent of models/
+ROOT = Path(__file__).resolve().parent.parent
+
+_ap = argparse.ArgumentParser(description=__doc__)
+_ap.add_argument("--data-dir", type=Path, default=ROOT / "data",
+                 help="directory holding the splits from make_splits.py")
+_ap.add_argument("--outdir", type=Path, default=ROOT / "models" / "runs" / "gravity",
+                 help="where the fitted model and metrics are written")
+_ap.add_argument("--stdout", action="store_true",
+                 help="print to the terminal instead of redirecting to a file")
+args = _ap.parse_args()
+
+# The output directory is created BEFORE stdout is redirected into it. The
+# previous version redirected stdout to `simple_gravity/baseline_gravity.txt`
+# at import time without creating the directory, so the script died on its
+# first statement -- and because stderr had been pointed at the same unopened
+# file, it died silently.
+args.outdir.mkdir(parents=True, exist_ok=True)
+
+if not args.stdout:
+    sys.stdout = open(args.outdir / "baseline_gravity.txt", "w",
+                      buffering=1, encoding="utf-8")
+    sys.stderr = sys.stdout
 
 
 def common_part_of_commuters(y_true, y_pred):
@@ -41,16 +76,32 @@ t0 = time.time()
 rng = np.random.default_rng(42)
 NEG_RATE = 0.3
 
-X_train_df = pl.read_csv("data/X_train.csv")
-X_test_df = pl.read_csv("data/X_test.csv")
-y_train_df = pl.read_csv("data/y_train.csv")
-y_test_df = pl.read_csv("data/y_test.csv")
+def _read(name):
+    path = args.data_dir / name
+    if not path.exists():
+        raise SystemExit(
+            f"missing {path}"
+            "\nBuild the splits first:  python models/make_splits.py"
+        )
+    return pl.read_csv(path)
 
-# or from any implicit tuning against the test set).
-X_inference_df = pl.read_csv("data/X_inference.csv")
-y_inference_df = pl.read_csv("data/y_inference.csv")
+X_train_df = _read("X_train.csv")
+X_test_df = _read("X_test.csv")
+y_train_df = _read("y_train.csv")
+y_test_df = _read("y_test.csv")
 
-FEATS = ["src_total_pop", "dst_total_pop", "distance_km"]
+# The inference split is reported separately so that no number in the paper is
+# read off a split that was used for model selection.
+X_inference_df = _read("X_inference.csv")
+y_inference_df = _read("y_inference.csv")
+
+# Column names as the pipeline writes them. The previous list
+# ("src_total_pop", "dst_total_pop", "distance_km") came from an earlier panel
+# and matches nothing here, so every run raised a polars ColumnNotFound.
+FEATS = ["src_pop", "dst_pop", "dist_geodesic_km"]
+_missing = [c for c in FEATS if c not in X_train_df.columns]
+if _missing:
+    raise SystemExit(f"missing feature columns {_missing}; have {X_train_df.columns}")
 pop_train = X_train_df.select(FEATS).to_numpy().astype(np.float64)
 pop_test = X_test_df.select(FEATS).to_numpy().astype(np.float64)
 pop_inference = X_inference_df.select(FEATS).to_numpy().astype(np.float64)
@@ -100,7 +151,7 @@ pred_inference = result.predict(X_inference)
 test_metrics = eval_metrics("test", y_test, pred_test)
 inference_metrics = eval_metrics("inference", y_inference, pred_inference)
 
-result.save("simple_gravity/gravity_ppml_model.pkl")
+result.save(str(args.outdir / "gravity_ppml_model.pkl"))
 
 results = {
     "params": result.params.tolist(),
@@ -109,6 +160,8 @@ results = {
     "neg_sample_rate": NEG_RATE,
     "seed": 42,
 }
-joblib.dump(results, "simple_gravity/results_baseline_gravity.pkl")
+joblib.dump(results, args.outdir / "results_baseline_gravity.pkl")
 print(f"\n{time.time()-t0:.1f}s")
-sys.stdout.close()
+print(f"wrote {args.outdir}")
+if not args.stdout:
+    sys.stdout.close()

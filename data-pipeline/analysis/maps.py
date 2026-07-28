@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -15,14 +16,25 @@ from libpysal.weights import KNN
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import spearmanr
 
-import geobr
+import geopandas as gpd
+
+# Repo root: analysis/ lives at <root>/data-pipeline/analysis/
+ROOT = Path(__file__).resolve().parent.parent.parent
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--name", type=str, required=True)
 parser.add_argument("--gpu", action="store_true", default=False)
-parser.add_argument("--income",  type=str, default="mean_income")
+parser.add_argument("--income",  type=str, default="gdppc",
+                    help="substring identifying the income node features "
+                         "(this panel uses gdppc / gdppc_sq)")
 parser.add_argument("--n_perm", type=int, default=999)
 parser.add_argument("--top_edges", type=int, default=3000)
+parser.add_argument("--data-dir", type=Path, default=None,
+                    help="splits directory (default <repo>/data)")
+parser.add_argument("--outdir", type=Path, default=None,
+                    help="run directory (default <repo>/models/runs)")
+parser.add_argument("--boundaries", type=Path, default=None,
+                    help="harmonized municipal boundaries gpkg")
 args = parser.parse_args()
 
 torch.manual_seed(42)
@@ -31,11 +43,15 @@ rng = np.random.default_rng(42)
 
 INCOME_KEY = args.income
 
-os.makedirs("the_gnn", exist_ok=True)
-FIG_DIR = f"the_gnn/figs_{args.name}"
-os.makedirs(FIG_DIR, exist_ok=True)
+DATA_DIR = args.data_dir or (ROOT / "data")
+OUT_DIR = args.outdir or (ROOT / "models" / "runs")
+BOUNDARIES = args.boundaries or (ROOT / "data-pipeline" / "data" / "processed"
+                                / "municipios_harmonized_2020.gpkg")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+FIG_DIR = OUT_DIR / f"figs_{args.name}"
+FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-log_file = open(f"the_gnn/info_{args.name}_maps.txt", "w")
+log_file = open(OUT_DIR / f"info_{args.name}_maps.txt", "w", encoding="utf-8")
 def log(msg):
     print(msg)
     log_file.write(msg + "\n")
@@ -54,7 +70,7 @@ plt.rcParams.update({
 
 def savefig(fig, name):
     fig.tight_layout()
-    fig.savefig(f"{FIG_DIR}/{name}.png", dpi=300, bbox_inches="tight", facecolor="white")
+    fig.savefig(FIG_DIR / f"{name}.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -112,12 +128,26 @@ def binned_line_plot(ax, xvals, yvals, n_bins=20, color="#2c7fb8", label=None):
 DROP_NODE_FEATURES = []
 DROP_EDGE_FEATURES = []
 
-X_train     = pl.read_csv("data/X_train.csv")
-X_test      = pl.read_csv("data/X_test.csv")
-X_inference = pl.read_csv("data/X_inference.csv")
-Y_train     = pl.read_csv("data/y_train.csv")
-Y_test      = pl.read_csv("data/y_test.csv")
-Y_inference = pl.read_csv("data/y_inference.csv")
+# CVEGEO stays a string: `01001` must not become `1001`, or joins against
+# the harmonized boundaries silently miss states 01-09.
+CODE_DTYPES = {"source_code": pl.Utf8, "dest_code": pl.Utf8}
+
+def _read_x(name):
+    path = DATA_DIR / name
+    if not path.exists():
+        raise SystemExit(
+            f"missing {path}"
+            "\nBuild the splits first:  python models/make_splits.py"
+        )
+    df = pl.read_csv(path, schema_overrides=CODE_DTYPES)
+    return df.with_columns([pl.col(c).str.zfill(5) for c in CODE_DTYPES])
+
+X_train     = _read_x("X_train.csv")
+X_test      = _read_x("X_test.csv")
+X_inference = _read_x("X_inference.csv")
+Y_train     = pl.read_csv(DATA_DIR / "y_train.csv")
+Y_test      = pl.read_csv(DATA_DIR / "y_test.csv")
+Y_inference = pl.read_csv(DATA_DIR / "y_inference.csv")
 
 y_col = "flow" if "flow" in Y_train.columns else Y_train.columns[0]
 
@@ -175,22 +205,24 @@ X_train_edge = edge_scaler.fit_transform(X_train.select(dyadic_cols).to_numpy().
 X_test_edge  = edge_scaler.transform(X_test.select(dyadic_cols).to_numpy().astype(np.float32))
 X_infer_edge = edge_scaler.transform(X_inference.select(dyadic_cols).to_numpy().astype(np.float32))
 
-state_from_code = (all_nodes["city_code"] // 100000).to_numpy().astype(np.int64)
+# CVEGEO is `SSMMM`: state is the first two characters. `// 100000`
+# assumed Brazil's 7-digit IBGE codes.
+state_from_code = np.array([c[:2] for c in city_codes])
 
-centroid_cache = "data/muni_centroids.csv"
-if os.path.exists(centroid_cache):
-    cent = pl.read_csv(centroid_cache)
-    code_to_latlon = {int(c): (float(la), float(lo))
-                      for c, la, lo in zip(cent["code_muni"], cent["lat"], cent["lon"])}
-else:
-    muni_src = geobr.read_municipality(year=2010, simplified=True, verbose=False)
-    code_to_latlon = {
-        int(row["code_muni"]): (float(row.geometry.centroid.y), float(row.geometry.centroid.x))
-        for _, row in muni_src.iterrows()
-    }
-    pl.DataFrame({"code_muni": list(code_to_latlon),
-                  "lat": [v[0] for v in code_to_latlon.values()],
-                  "lon": [v[1] for v in code_to_latlon.values()]}).write_csv(centroid_cache)
+# Centroids come from the pipeline (03_distance.py), keyed on the same
+# harmonized 2,457-municipality universe as the panel. The previous version
+# fell back to `geobr.read_municipality()` -- the Brazilian boundary package
+# -- which would have attached Brazilian centroids to Mexican codes.
+centroid_cache = DATA_DIR / "muni_centroids.csv"
+if not centroid_cache.exists():
+    raise SystemExit(
+        f"missing {centroid_cache}"
+        "\nIt is written by make_splits.py from the pipeline output."
+    )
+cent = pl.read_csv(centroid_cache, schema_overrides={"cvegeo": pl.Utf8})
+cent = cent.with_columns(pl.col("cvegeo").str.zfill(5))
+code_to_latlon = {c: (float(la), float(lo))
+                  for c, la, lo in zip(cent["cvegeo"], cent["lat"], cent["lon"])}
 
 node_lat = np.array([code_to_latlon.get(c, (np.nan, np.nan))[0] for c in city_codes])
 node_lon = np.array([code_to_latlon.get(c, (np.nan, np.nan))[1] for c in city_codes])
@@ -201,7 +233,8 @@ for i in np.where(~has_coords)[0]:
     if len(peers):
         node_lat[i], node_lon[i] = node_lat[peers].mean(), node_lon[peers].mean()
     else:
-        node_lat[i], node_lon[i] = -15.78, -47.93
+        # Geographic centre of Mexico, not Brasilia.
+        node_lat[i], node_lon[i] = 23.63, -102.55
     has_coords[i] = True
 
 K = 5
@@ -214,7 +247,15 @@ for i, neighbors in w.neighbors.items():
 adj_edge_index = torch.tensor(np.array([src_list, dst_list]), dtype=torch.long)
 adj_weights    = torch.tensor(np.array(wt_list), dtype=torch.float)
 
-gravity_edge_idx = [i for i, c in enumerate(dyadic_cols) if c in ("pop_ratio", "distance_km")]
+# "pop_ratio"/"distance_km" do not exist in this panel; distance is
+# `dist_geodesic_km`. The old names gave an empty list, silently disabling
+# the gravity skip connection. Population enters via the node features.
+GRAVITY_EDGE_COLS = ("dist_geodesic_km",)
+gravity_edge_idx = [i for i, c in enumerate(dyadic_cols) if c in GRAVITY_EDGE_COLS]
+if not gravity_edge_idx:
+    raise SystemExit(
+        f"gravity_edge_idx is empty: none of {GRAVITY_EDGE_COLS} in {dyadic_cols}"
+    )
 
 x = torch.tensor(node_features, dtype=torch.float)
 deg = torch.zeros(x.shape[0])
@@ -388,7 +429,7 @@ src_train, dst_train, ea_train, y_train = to_dev(src_train, dst_train, ea_train,
 src_test,  dst_test,  ea_test,  y_test  = to_dev(src_test,  dst_test,  ea_test,  y_test)
 src_infer, dst_infer, ea_infer, y_infer = to_dev(src_infer, dst_infer, ea_infer, y_infer)
 
-ckpt_path = f"the_gnn/best_sgdg_{args.name}.pt"
+ckpt_path = OUT_DIR / f"best_sgdg_{args.name}.pt"
 if not os.path.exists(ckpt_path):
     raise FileNotFoundError(f"no checkpoint found at {ckpt_path}; this script does not train a model")
 
@@ -468,21 +509,31 @@ def node_mean_residual(pred, y, src_idx):
     arr[nodes], mask[nodes] = resids, True
     return arr, mask
 
-def moran_on_subgraph(values, mask, n_perm, seed):
-    edge_np  = adj_edge_index.cpu().numpy()
-    sub_mask = mask[edge_np[0]] & mask[edge_np[1]]
-    if mask.sum() < 10 or sub_mask.sum() < 10:
-        return None
-    sub_idx = torch.tensor(sub_mask, device=dev)
-    return morans_i_test(torch.tensor(values, dtype=torch.float, device=dev),
-                         adj_edge_index[:, sub_idx], adj_weights[sub_idx], n_perm, seed)
-
-model_resid, model_mask = node_mean_residual(pred_test, y_test, src_test)
-result = moran_on_subgraph(model_resid, model_mask, args.n_perm, 42)
-if result:
-    i_m, z_m, p_m = result
-    log(f"  model residual / node     I={i_m:+.4f}  z={z_m:+.2f}  p={p_m:.4f}  n={int(model_mask.sum())}")
-
+# --- REMOVED: the residual Moran's I on the test subgraph --------------------
+# There used to be a `moran_on_subgraph()` here, reporting a line like
+#
+#     model residual / node     I=+2.0043  z=+33.26  p=0.0100  n=452
+#
+# Moran's I is not defined above ~1 under row-standardised weights, and the
+# computation was wrong in two compounding ways. `adj_weights` is
+# row-standardised over the FULL 2,457-node graph, so S0 equals N there; the
+# function kept only edges with both endpoints in the test mask (452 nodes) while
+# reusing those weights, so the subgraph's S0 fell far below its node count. And
+# the full-length value array was passed through unchanged, so N = 2,457 and the
+# mean and variance were taken over all 2,457 nodes, including the ~2,000 not in
+# the subgraph. The N/S0 factor is then a full-graph N over a subgraph S0.
+#
+# Spatial autocorrelation is measured in `moran.py` (this directory) instead,
+# which uses `esda.Moran` on properly row-standardised weights: Global Moran's I
+# = 0.305 on out-migration flows, 0.318 on the OLS error. That is the reported
+# figure.
+#
+# The gate-activation Moran statistics above are retained: they are computed over
+# the whole graph, where S0 == N and the mismatch does not arise.
+#
+# `node_mean_residual()` is still used, further down, for the residual choropleth.
+log("=" * 60)
+log("residual spatial autocorrelation: see moran.py (esda-based)")
 log("=" * 60)
 
 if raw_income is not None:
@@ -539,12 +590,13 @@ edge_importances.sort(key=lambda t: t[1], reverse=True)
 for name, imp in edge_importances:
     log(f"  {name:30s}  {imp:+.5f}")
 
-np.savez(f"the_gnn/climate_embeddings_{args.name}.npz",
+emb_path = OUT_DIR / f"climate_embeddings_{args.name}.npz"
+np.savez(emb_path,
          climate_names=np.array([feat_cols[i] for i in climate_idx]),
          gamma_src=mean_gamma_src, beta_src=mean_beta_src,
          gamma_dst=mean_gamma_dst, beta_dst=mean_beta_dst,
          h_src=h_src_final.cpu().numpy(), h_dst=h_dst_final.cpu().numpy())
-log(f"saved gates + embeddings -> the_gnn/climate_embeddings_{args.name}.npz")
+log(f"saved gates + embeddings -> {emb_path}")
 
 # =================================================================
 # PLOTS
@@ -598,7 +650,15 @@ ax.set_title(f"Predicted vs. True Flow (Test)\nCPC={test_cpc:.3f}  RMSE={test_rm
 ax.set_xlim(lims); ax.set_ylim(lims)
 savefig(fig, "pred_vs_true_flow")
 
-muni = geobr.read_municipality(code_muni="all", year=2020)
+# Harmonized Mexican municipal boundaries from the pipeline -- the same
+# 2,457-municipality universe as the panel. Was geobr, i.e. Brazil.
+if not BOUNDARIES.exists():
+    raise SystemExit(
+        f"missing {BOUNDARIES}"
+        "\nBuild it first:  cd data-pipeline && make all"
+    )
+muni = gpd.read_file(BOUNDARIES)
+muni["cvegeo"] = muni["cvegeo"].astype(str).str.zfill(5)
 
 def flow_graph_plot(src_idx_np, dst_idx_np, weights, title, fname, top_n, cmap_name="viridis"):
     order = np.argsort(weights)[::-1][:top_n]
@@ -642,8 +702,17 @@ resid_df = pl.DataFrame({
     "city_code": [city_codes[i] for i in range(num_nodes) if resid_mask[i]],
     "residual": resid_arr[resid_mask],
 })
-muni["code_muni"] = pd.to_numeric(muni["code_muni"], errors="coerce").fillna(0).astype(int)
-resid_map = muni.merge(resid_df.to_pandas(), left_on="code_muni", right_on="city_code", how="left")
+# String-to-string join on CVEGEO. Coercing the key to int dropped the
+# leading zero and matched nothing in states 01-09.
+resid_map = muni.merge(resid_df.to_pandas(), left_on="cvegeo",
+                       right_on="city_code", how="left")
+_matched = resid_map["residual"].notna().sum()
+log(f"residual choropleth: {_matched} of {len(resid_df)} municipios matched")
+if _matched == 0:
+    raise SystemExit(
+        "residual choropleth matched 0 municipios -- check that city_code "
+        "and cvegeo are both zero-padded 5-character strings"
+    )
 
 fig, ax = plt.subplots(figsize=(12, 12))
 resid_map.plot(

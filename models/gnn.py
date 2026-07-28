@@ -1,5 +1,17 @@
+"""
+Spatially-Gated Deep GNN -- training and evaluation on the Mexican
+municipality-to-municipality migration panel.
+
+Inputs are the modelling splits written by `models/make_splits.py`; build them
+with `python models/make_splits.py` before running this. Geographic codes are
+5-character zero-padded CVEGEO strings throughout (see `make_splits.py` and
+`data-pipeline/src/common.py` for why they are never integers).
+"""
+
 import argparse
 import os
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import torch
@@ -12,30 +24,58 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import spearmanr
 from tqdm import tqdm
 
-import geobr
+# Repo root = parent of models/
+ROOT = Path(__file__).resolve().parent.parent
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--name", type=str, required=True)
 parser.add_argument("--gpu",  action="store_true", default=False)
+parser.add_argument("--data-dir", type=Path, default=ROOT / "data",
+                    help="directory holding the splits from make_splits.py")
+parser.add_argument("--outdir", type=Path, default=ROOT / "models" / "runs",
+                    help="where checkpoints, logs and embeddings are written")
+parser.add_argument("--epochs", type=int, default=800,
+                    help="training epochs (800 is the value used for the paper)")
 args = parser.parse_args()
 
 torch.manual_seed(42)
 np.random.seed(42)
 rng = np.random.default_rng(42)
 
-log_file = open(f"the_gnn/info_{args.name}.txt", "w")
+# Created before the log is opened -- the previous version opened the log file
+# inside a directory that did not exist, so the script died on its first line
+# with a bare FileNotFoundError.
+args.outdir.mkdir(parents=True, exist_ok=True)
+
+log_file = open(args.outdir / f"info_{args.name}.txt", "w", encoding="utf-8")
 def log(msg):
     print(msg); log_file.write(msg + "\n"); log_file.flush()
 
 DROP_NODE_FEATURES = []
 DROP_EDGE_FEATURES = []
 
-X_train     = pl.read_csv("data/X_train.csv")
-X_test      = pl.read_csv("data/X_test.csv")
-X_inference = pl.read_csv("data/X_inference.csv")
-Y_train     = pl.read_csv("data/y_train.csv")
-Y_test      = pl.read_csv("data/y_test.csv")
-Y_inference = pl.read_csv("data/y_inference.csv")
+# CVEGEO stays a string: `01001` must not become `1001`, or every join against
+# the harmonized boundary file silently misses states 01-09.
+CODE_DTYPES = {"source_code": pl.Utf8, "dest_code": pl.Utf8}
+
+def _read_x(name):
+    path = args.data_dir / name
+    if not path.exists():
+        raise SystemExit(
+            f"missing {path}\nBuild the splits first:  python models/make_splits.py"
+        )
+    df = pl.read_csv(path, schema_overrides=CODE_DTYPES)
+    return df.with_columns([pl.col(c).str.zfill(5) for c in CODE_DTYPES])
+
+def _read_y(name):
+    return pl.read_csv(args.data_dir / name)
+
+X_train     = _read_x("X_train.csv")
+X_test      = _read_x("X_test.csv")
+X_inference = _read_x("X_inference.csv")
+Y_train     = _read_y("y_train.csv")
+Y_test      = _read_y("y_test.csv")
+Y_inference = _read_y("y_inference.csv")
 
 y_col = "flow" if "flow" in Y_train.columns else Y_train.columns[0]
 
@@ -77,11 +117,29 @@ city_to_idx = {code: i for i, code in enumerate(city_codes)}
 num_nodes   = len(city_codes)
 city_map_df = pl.DataFrame({"city_code": city_codes, "node_idx": list(range(num_nodes))})
 
+# Node feature names have already had their `src_`/`dst_` prefix stripped by
+# build_node_frame, so they are bare: pop, gdppc, gdppc_sq, temp, precip,
+# dempres. The keyword lists must match THAT vocabulary.
+#
+# The previous lists were inherited from an earlier panel whose climate columns
+# were named `mean_temp` / `total_precip`, and matched on the leading underscore
+# ("_temp", "_precip"). Against these names nothing matched, `climate_idx` came
+# out EMPTY, and the income-conditioned climate gate -- the mechanism this model
+# exists to estimate -- was silently built over zero features. It failed open,
+# not loud, which is exactly the kind of bug that reaches print.
 income_keywords  = ["gdp"]
-climate_keywords = ["_temp", "_precip", "ndvi", "uv",
+climate_keywords = ["temp", "precip", "ndvi", "uv",
                     "wind_mean", "wet_bulb", "degree_day"]
 income_idx  = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in income_keywords)]
 climate_idx = [i for i, c in enumerate(feat_cols) if any(k in c.lower() for k in climate_keywords)]
+
+if not income_idx:
+    raise SystemExit(f"income_idx is empty; node features are {feat_cols}")
+if not climate_idx:
+    raise SystemExit(f"climate_idx is empty; node features are {feat_cols}")
+log(f"node features : {feat_cols}")
+log(f"  income_idx  : {[feat_cols[i] for i in income_idx]}")
+log(f"  climate_idx : {[feat_cols[i] for i in climate_idx]}")
 
 node_scaler   = StandardScaler()
 node_features = node_scaler.fit_transform(all_nodes.select(feat_cols).to_numpy().astype(np.float32))
@@ -97,32 +155,48 @@ X_train_edge = edge_scaler.fit_transform(X_train.select(dyadic_cols).to_numpy().
 X_test_edge  = edge_scaler.transform(X_test.select(dyadic_cols).to_numpy().astype(np.float32))
 X_infer_edge = edge_scaler.transform(X_inference.select(dyadic_cols).to_numpy().astype(np.float32))
 
-state_from_code = (all_nodes["city_code"] // 100000).to_numpy().astype(np.int64)
+# CVEGEO is `SSMMM`: the first two characters are the state (entidad). Taking
+# the state by integer division assumed Brazil's 7-digit IBGE codes.
+state_from_code = np.array([c[:2] for c in city_codes])
 
-centroid_cache = "data/muni_centroids.csv"
-if os.path.exists(centroid_cache):
-    cent = pl.read_csv(centroid_cache)
-    code_to_latlon = {int(c): (float(la), float(lo))
-                      for c, la, lo in zip(cent["code_muni"], cent["lat"], cent["lon"])}
-else:
-    muni = geobr.read_municipality(year=2010, simplified=True, verbose=False)
-    code_to_latlon = {
-        int(row["code_muni"]): (float(row.geometry.centroid.y), float(row.geometry.centroid.x))
-        for _, row in muni.iterrows()
-    }
-    pl.DataFrame({"code_muni": list(code_to_latlon),
-                  "lat": [v[0] for v in code_to_latlon.values()],
-                  "lon": [v[1] for v in code_to_latlon.values()]}).write_csv(centroid_cache)
+# Centroids come from the pipeline (03_distance.py -> municipios_centroids.csv,
+# copied into data/ by make_splits.py), keyed on the same harmonized 2,457-
+# municipality universe as the panel. The previous version fell back to
+# `geobr.read_municipality()` -- the Brazilian boundary package -- which would
+# have silently attached Brazilian centroids to Mexican municipality codes.
+# There is no sensible fallback for missing geometry, so this is a hard failure.
+centroid_cache = args.data_dir / "muni_centroids.csv"
+if not centroid_cache.exists():
+    raise SystemExit(
+        f"missing {centroid_cache}\n"
+        "It is written by make_splits.py from the pipeline's\n"
+        "data-pipeline/data/processed/municipios_centroids.csv."
+    )
+cent = pl.read_csv(centroid_cache, schema_overrides={"cvegeo": pl.Utf8})
+cent = cent.with_columns(pl.col("cvegeo").str.zfill(5))
+code_to_latlon = {c: (float(la), float(lo))
+                  for c, la, lo in zip(cent["cvegeo"], cent["lat"], cent["lon"])}
+
 node_lat = np.array([code_to_latlon.get(c, (np.nan, np.nan))[0] for c in city_codes])
 node_lon = np.array([code_to_latlon.get(c, (np.nan, np.nan))[1] for c in city_codes])
 has_coords = ~np.isnan(node_lat)
+
+n_missing = int((~has_coords).sum())
+if n_missing:
+    log(f"WARNING {n_missing} of {len(city_codes)} nodes have no centroid; "
+        f"substituting their state's mean centroid")
+    log(f"        {[city_codes[i] for i in np.where(~has_coords)[0]][:20]}")
 
 for i in np.where(~has_coords)[0]:
     peers = np.where((state_from_code == state_from_code[i]) & has_coords)[0]
     if len(peers):
         node_lat[i], node_lon[i] = node_lat[peers].mean(), node_lon[peers].mean()
     else:
-        node_lat[i], node_lon[i] = -15.78, -47.93
+        # Last resort, and a genuinely arbitrary point: the geographic centre of
+        # Mexico. Reaching this means a whole state is missing from the centroid
+        # file, which is a data error worth investigating rather than papering
+        # over -- hence the warning above.
+        node_lat[i], node_lon[i] = 23.63, -102.55
     has_coords[i] = True
 
 K = 5
@@ -135,7 +209,22 @@ for i, neighbors in w.neighbors.items():
 adj_edge_index = torch.tensor(np.array([src_list, dst_list]), dtype=torch.long)
 adj_weights    = torch.tensor(np.array(wt_list), dtype=torch.float)
 
-gravity_edge_idx = [i for i, c in enumerate(dyadic_cols) if c in ("pop_ratio", "distance_km")]
+# The gravity skip connection is initialised to weight 1 on the raw gravity
+# terms so the model starts from a gravity baseline and learns departures from
+# it. The old names ("pop_ratio", "distance_km") do not exist in this panel --
+# distance is `dist_geodesic_km` and there is no ratio column -- so this
+# resolved to an EMPTY list and `nn.Linear(0, 1)` produced a constant, killing
+# the gravity initialisation without any error.
+#
+# Population is not missing from the model: `pop` is a NODE feature on both
+# endpoints, so the mass terms enter through the convolutions. Only the distance
+# term is carried on the edge.
+GRAVITY_EDGE_COLS = ("dist_geodesic_km",)
+gravity_edge_idx = [i for i, c in enumerate(dyadic_cols) if c in GRAVITY_EDGE_COLS]
+if not gravity_edge_idx:
+    raise SystemExit(
+        f"gravity_edge_idx is empty: none of {GRAVITY_EDGE_COLS} in {dyadic_cols}"
+    )
 
 x = torch.tensor(node_features, dtype=torch.float)
 deg = torch.zeros(x.shape[0])
@@ -391,10 +480,10 @@ def eval_split(model, h_src, h_dst, src, dst, ea, y_raw, neg):
         loss = flow_loss(pred, y_raw).item()
         return loss, rmse(pred, y_raw), cpc(pred, y_raw)
 
-ckpt_path      = f"the_gnn/best_sgdg_{args.name}.pt"
+ckpt_path      = args.outdir / f"best_sgdg_{args.name}.pt"
 best_infer_cpc = -1
 n_neg_train    = int(len(src_train) * 0.3)
-pbar = tqdm(range(1, 800 + 1))
+pbar = tqdm(range(1, args.epochs + 1))
 
 for epoch in pbar:
     model.train(); optimizer.zero_grad()
@@ -434,7 +523,16 @@ for epoch in pbar:
 
 log(f"best inference CPC: {best_infer_cpc:.4f} -> {ckpt_path}")
 
-model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+# The checkpoint is only written inside the `epoch % 20` evaluation block, so a
+# run shorter than 20 epochs (or one where inference CPC never improves on its
+# initial -1) never produces one. Loading it unconditionally turned that into a
+# FileNotFoundError after training had already finished -- the whole run lost at
+# the last line. Fall back to the in-memory weights instead, loudly.
+if ckpt_path.exists():
+    model.load_state_dict(torch.load(ckpt_path, map_location=dev))
+else:
+    log(f"WARNING no checkpoint at {ckpt_path} -- evaluating the final-epoch "
+        f"weights instead of the best ones. Expected only for --epochs < 20.")
 model.eval()
 
 with torch.no_grad():
@@ -510,36 +608,32 @@ def node_mean_residual(pred, y, src_idx):
     arr[nodes], mask[nodes] = resids, True
     return arr, mask
 
-def moran_on_subgraph(values, mask, n_perm, seed):
-    edge_np  = adj_edge_index.cpu().numpy()
-    sub_mask = mask[edge_np[0]] & mask[edge_np[1]]
-    if mask.sum() < 10 or sub_mask.sum() < 10:
-        return None
-    sub_idx = torch.tensor(sub_mask, device=dev)
-    return morans_i_test(torch.tensor(values, dtype=torch.float, device=dev),
-                         adj_edge_index[:, sub_idx], adj_weights[sub_idx], n_perm, seed)
-
-model_resid, model_mask = node_mean_residual(pred_test, y_test, src_test)
-result = moran_on_subgraph(model_resid, model_mask, 999, 42)
-if result:
-    i_m, z_m, p_m = result
-    log(f"  model residual / node     I={i_m:+.4f}  z={z_m:+.2f}  p={p_m:.4f}  n={int(model_mask.sum())}")
-
-gravity_feats  = X_train.select(["distance_km", "pop_ratio"]).to_numpy().astype(np.float64)
-gravity_design = np.column_stack([np.ones(len(gravity_feats)), gravity_feats])
-gravity_coef, *_ = np.linalg.lstsq(gravity_design, y_train.cpu().numpy().astype(np.float64), rcond=None)
-
-test_gravity_feats  = X_test.select(["distance_km", "pop_ratio"]).to_numpy().astype(np.float64)
-test_gravity_design = np.column_stack([np.ones(len(test_gravity_feats)), test_gravity_feats])
-gravity_pred_test    = test_gravity_design @ gravity_coef
-gravity_resid        = y_test.cpu().numpy().astype(np.float64) - gravity_pred_test
-
-gravity_resid_t, gravity_mask = node_mean_residual(
-    torch.tensor(gravity_resid, dtype=torch.float, device=dev), torch.zeros_like(y_test), src_test)
-result = moran_on_subgraph(gravity_resid_t, gravity_mask, 999, 42)
-if result:
-    i_g, z_g, p_g = result
-    log(f"  gravity-only residual/node I={i_g:+.4f}  z={z_g:+.2f}  p={p_g:.4f}  n={int(gravity_mask.sum())}")
+# --- REMOVED: the residual Moran's I on the test subgraph --------------------
+# There used to be a `moran_on_subgraph()` here, plus a gravity-only least-squares
+# baseline whose residuals were passed through it, reporting lines like
+#
+#     model residual / node      I=+3.4047  z=+57.78  p=0.0010  n=452
+#     gravity-only residual/node I=+2.9139  z=+50.17  p=0.0010  n=452
+#
+# Those values are impossible: Moran's I is not defined above ~1 under
+# row-standardised weights. The computation was wrong in two compounding ways.
+# `adj_weights` is row-standardised over the FULL 2,457-node graph, so S0 equals
+# N there; the function then kept only edges with both endpoints in the test mask
+# (452 nodes) while reusing those weights, so the subgraph's S0 fell far below its
+# node count. And the full-length value array was passed through unchanged, so
+# N = 2,457 and the mean and variance were taken over all 2,457 nodes -- including
+# the ~2,000 not in the subgraph at all. The resulting N/S0 factor is a full-graph
+# N over a subgraph S0, which inflates I without bound.
+#
+# Rather than reimplement it, spatial autocorrelation is measured in
+# `data-pipeline/analysis/moran.py`, which uses `esda.Moran` on properly
+# row-standardised weights and reports Global Moran's I = 0.305 on out-migration
+# flows (Moran's I on the OLS error = 0.318). That is the reported figure.
+#
+# The gate-activation Moran statistics above are retained: they are computed over
+# the whole graph, where S0 == N and the mismatch does not arise.
+log("=" * 60)
+log("residual spatial autocorrelation: see analysis/moran.py (esda-based)")
 log("=" * 60)
 
 if raw_income is not None:
@@ -612,11 +706,12 @@ for ci, name in enumerate(climate_names):
     log(f"  [{name:25s}] dst  gamma_mean={g_dst.mean():.4f}  ||emb||={np.linalg.norm(emb_dst_w):.4f}  "
         f"dims[:8]={np.array2string(emb_dst_w[:8], precision=3, suppress_small=True)}")
 
-np.savez(f"the_gnn/climate_embeddings_{args.name}.npz",
+emb_path = args.outdir / f"climate_embeddings_{args.name}.npz"
+np.savez(emb_path,
          climate_names=np.array(climate_names),
          gamma_src=mean_gamma_src, beta_src=mean_beta_src,
          gamma_dst=mean_gamma_dst, beta_dst=mean_beta_dst,
          h_src=emb_src_np, h_dst=emb_dst_np)
-log(f"saved per-climate-feature gates + embeddings -> the_gnn/climate_embeddings_{args.name}.npz")
+log(f"saved per-climate-feature gates + embeddings -> {emb_path}")
 
 log_file.close()

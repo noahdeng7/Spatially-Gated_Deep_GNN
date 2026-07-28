@@ -1,0 +1,71 @@
+# Spatially-Gated Deep GNN : modelling dependencies
+#
+# These are the versions the models were last run and verified against
+# (Python 3.13, Windows, CPU). They are a SUPERSET of data-pipeline/requirements.txt
+# in scope but are pinned independently -- see the note at the bottom.
+#
+# Install:
+#   python -m venv .venv
+#   .venv/Scripts/activate      (Windows)   |   source .venv/bin/activate  (POSIX)
+#   pip install -r models/requirements.txt
+
+# --- deep learning ---
+# CPU build. For CUDA, install the matching wheel from https://pytorch.org
+# first, then this file (pip will keep the already-installed torch).
+torch==2.9.1
+torch_geometric==2.8.0.post1
+
+# --- core numeric / tabular ---
+numpy==2.3.3
+pandas==2.3.3
+polars==1.41.2
+scipy==1.16.2
+
+# --- estimation ---
+scikit-learn==1.7.2
+statsmodels==0.14.6
+joblib==1.5.2
+
+# --- spatial statistics ---
+# libpysal supplies the KNN spatial weights used to build the graph;
+# esda and spreg are used by analysis/moran.py.
+libpysal==4.15.0
+esda==2.10.0
+spreg==1.9.0
+
+# --- geospatial ---
+geopandas==1.1.0
+shapely==2.1.0
+pyogrio==0.12.1
+
+# --- plotting ---
+matplotlib==3.10.7
+mapclassify==2.10.0
+
+# --- progress ---
+tqdm==4.67.1
+
+# ---------------------------------------------------------------------------
+# NOTE ON VERSION DRIFT
+#
+# data-pipeline/requirements.txt pins older versions of four shared packages:
+#
+#   package     pipeline pin   verified here
+#   numpy       2.1.3          2.3.3
+#   polars      1.17.1         1.41.2
+#   pandas      2.2.3          2.3.3
+#   geopandas   1.0.1          1.1.0
+#
+# Installing both files into one environment resolves to whichever is installed
+# last, so the two halves of the repository have not been verified against a
+# single dependency set. Either reconcile the pins or document that the pipeline
+# and the models are meant to run in separate virtual environments.
+#
+# NOTE ON `geobr`
+#
+# Earlier versions of the model scripts imported `geobr`, the Brazilian
+# geodata package, and called `geobr.read_municipality()` to obtain municipal
+# boundaries and centroids. That was a leftover from a Brazilian application of
+# the same model. It is deliberately absent here: all Mexican geometry now comes
+# from the pipeline's own harmonized boundary file. Do not reintroduce it.
+# ---------------------------------------------------------------------------

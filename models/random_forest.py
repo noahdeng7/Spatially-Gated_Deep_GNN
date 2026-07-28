@@ -1,16 +1,56 @@
+"""
+Random-forest baseline for the Mexican municipality-to-municipality migration
+panel.
+
+Regresses log1p(migrants) on the dyad's covariates, tuning `min_samples_leaf`
+and `n_estimators` by out-of-bag MSE. Inputs are the splits written by
+`models/make_splits.py`.
+"""
+
+import argparse
 import sys
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 import joblib
 
-sys.stdout = open("random_forest/final_run.txt", "w", buffering=1)
-sys.stderr = sys.stdout
+# Repo root = parent of models/
+ROOT = Path(__file__).resolve().parent.parent
+
+_ap = argparse.ArgumentParser(description=__doc__)
+_ap.add_argument("--data-dir", type=Path, default=ROOT / "data",
+                 help="directory holding the splits from make_splits.py")
+_ap.add_argument("--outdir", type=Path,
+                 default=ROOT / "models" / "runs" / "random_forest",
+                 help="where the fitted model and metrics are written")
+_ap.add_argument("--stdout", action="store_true",
+                 help="print to the terminal instead of redirecting to a file")
+args = _ap.parse_args()
+
+# Created BEFORE stdout is redirected into it. The previous version redirected
+# both stdout and stderr into `random_forest/final_run.txt` at import time
+# without creating the directory, so the script died on its first statement with
+# nowhere to report the error.
+args.outdir.mkdir(parents=True, exist_ok=True)
+
+if not args.stdout:
+    sys.stdout = open(args.outdir / "final_run.txt", "w",
+                      buffering=1, encoding="utf-8")
+    sys.stderr = sys.stdout
 
 NEG_SAMPLE_RATE = 0.3
 MTRY_FRACTION = 1.0 / 3.0
 rng = np.random.default_rng(42)
+
+# The two geographic keys are identifiers, not covariates. They must be dropped
+# explicitly: read from CSV, `01001` is inferred as the integer 1001, so the
+# automatic "drop the string columns" rule below does not catch them and the
+# municipality code would enter the forest as an ordinal predictor -- adding
+# noise and making the feature-importance table unreadable.
+ID_COLS = ["source_code", "dest_code"]
 
 
 def common_part_of_commuters(y_true, y_pred):
@@ -42,10 +82,18 @@ def eval_metrics(label, y_test_log, preds_log):
 
 
 def load_xy(x_path, y_path, non_numeric_cols=None):
+    for p in (x_path, y_path):
+        if not p.exists():
+            raise SystemExit(
+                f"missing {p}"
+                "\nBuild the splits first:  python models/make_splits.py"
+            )
     x_df = pl.read_csv(x_path)
     y_df = pl.read_csv(y_path)
     if non_numeric_cols is None:
         non_numeric_cols = [c for c, t in zip(x_df.columns, x_df.dtypes) if t == pl.String]
+        non_numeric_cols += [c for c in ID_COLS
+                             if c in x_df.columns and c not in non_numeric_cols]
     x_df = x_df.drop(non_numeric_cols)
     FILL_VALUE = np.finfo(np.float32).min
     x_df = x_df.with_columns([pl.col(c).fill_null(FILL_VALUE) for c in x_df.columns])
@@ -67,14 +115,17 @@ def oob_mse(model, y_true):
 
 
 X_train, y_train, train_cols, non_numeric_cols = load_xy(
-    "data/X_train.csv", "data/y_train_log1p.csv"
+    args.data_dir / "X_train.csv", args.data_dir / "y_train_log1p.csv"
 )
 X_test, y_test, _, _ = load_xy(
-    "data/X_test.csv", "data/y_test_log1p.csv", non_numeric_cols
+    args.data_dir / "X_test.csv", args.data_dir / "y_test_log1p.csv", non_numeric_cols
 )
 X_inference, y_inference, _, _ = load_xy(
-    "data/X_inference.csv", "data/y_inference_log1p.csv", non_numeric_cols
+    args.data_dir / "X_inference.csv", args.data_dir / "y_inference_log1p.csv",
+    non_numeric_cols
 )
+print(f"dropped as non-predictive: {non_numeric_cols}")
+print(f"predictors ({len(train_cols)}): {train_cols}")
 
 X_train, y_train, n_neg_train = add_negatives(X_train, y_train, NEG_SAMPLE_RATE, rng)
 X_test, y_test, n_neg_test = add_negatives(X_test, y_test, NEG_SAMPLE_RATE, rng)
@@ -165,6 +216,8 @@ joblib.dump(
         "test_metrics": test_metrics,
         "inference_metrics": inference_metrics,
     },
-    "random_forest/best_random_forest_model_new.pkl",
+    args.outdir / "best_random_forest_model.pkl",
 )
-sys.stdout.close()
+print(f"\nwrote {args.outdir}")
+if not args.stdout:
+    sys.stdout.close()

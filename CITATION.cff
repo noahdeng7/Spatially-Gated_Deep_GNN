@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------------------
+# TEMPLATE -- COMPLETE BEFORE SUBMISSION
+#
+# Every line marked TODO must be filled in or deleted. GitHub validates this
+# file on push and will show a "Cite this repository" button once it parses;
+# a malformed file is silently ignored, so check it renders.
+#
+# Validate locally:  pip install cffconvert && cffconvert --validate
+# ---------------------------------------------------------------------------
+cff-version: 1.2.0
+message: "If you use this software or dataset, please cite both the software and the paper below."
+title: "Spatially-Gated Deep GNN: income-conditioned climate gating for internal migration flows in Mexico"
+abstract: >-
+  A reproducible pipeline that assembles a dyadic municipality-to-municipality
+  internal migration dataset for Mexico (2,457 harmonized municipalities,
+  6,034,392 ordered pairs) with gravity-model covariates, and a graph neural
+  network whose climate features are gated by an income-conditioned FiLM layer.
+type: software
+license: MIT
+
+authors:
+  # TODO: replace with the full author list, in manuscript order.
+  - family-names: Dengler
+    given-names: Noah
+    email: noahjamesdengler@gmail.com
+    # TODO: add affiliation and ORCID
+    # affiliation: ""
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+
+# TODO: set once the repository is public / archived
+repository-code: "https://github.com/noahdeng7/Spatially-Gated_Deep_GNN"
+# TODO: mint a DOI (e.g. archive the release on Zenodo) and add it here
+# doi: "10.5281/zenodo.XXXXXXX"
+
+keywords:
+  - internal migration
+  - gravity model
+  - graph neural network
+  - spatial econometrics
+  - Mexico
+  - climate mobility
+
+# TODO: uncomment and complete once the manuscript has a venue.
+# preferred-citation:
+#   type: article
+#   title: "TODO: manuscript title"
+#   authors:
+#     - family-names: Dengler
+#       given-names: Noah
+#   journal: "TODO"
+#   year: 2026
+#   doi: "TODO"

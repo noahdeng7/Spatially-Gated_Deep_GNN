@@ -1,3 +1,17 @@
+"""
+Moran's I on municipality-level out-migration flows, plus an OLS table with
+spatial diagnostics and a flow choropleth.
+
+Inputs are the modelling splits from `models/make_splits.py` and the harmonized
+boundaries from the pipeline. Run from anywhere:
+
+    python data-pipeline/analysis/moran.py
+
+Outputs go to this directory (`ols_summary.txt`, `flow_map.png`).
+"""
+
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,6 +20,12 @@ from libpysal.weights import KNN
 from esda.moran import Moran
 from spreg import OLS
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+# Repo root: this file is at <root>/data-pipeline/analysis/moran.py
+ROOT = Path(__file__).resolve().parent.parent.parent
+HERE = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+PROCESSED = ROOT / "data-pipeline" / "data" / "processed"
 
 plt.rcParams.update({
     "font.size": 26,
@@ -18,13 +38,25 @@ plt.rcParams.update({
     "font.family": "serif",
 })
 
-x_train = pd.read_csv('data/processed/X_train_mx.csv')
-y_train = pd.read_csv('data/processed/y_train_mx.csv').rename(columns={'migrants': 'flow'})
+# The splits used to be written as `data/processed/X_train_mx.csv`; they are now
+# `data/X_train.csv` (the `_mx` suffix is redundant in a Mexico-only repository)
+# and are produced by models/make_splits.py. `source_code` is read as a string so
+# the zero padding on states 01-09 survives the join to `cvegeo` below.
+_x_path = DATA_DIR / "X_train.csv"
+if not _x_path.exists():
+    raise SystemExit(
+        f"missing {_x_path}"
+        "\nBuild the splits first:  python models/make_splits.py"
+    )
+
+x_train = pd.read_csv(_x_path, dtype={"source_code": str, "dest_code": str})
+y_train = pd.read_csv(DATA_DIR / "y_train.csv").rename(columns={'migrants': 'flow'})
 df = pd.concat([x_train, y_train], axis=1)
 
 muni_flows = df.groupby('source_code')['flow'].sum().reset_index()
 
-coords_df = pd.read_csv('data/processed/municipios_centroids.csv')[['cvegeo', 'lat', 'lon']]
+coords_df = pd.read_csv(PROCESSED / "municipios_centroids.csv",
+                        dtype={"cvegeo": str})[['cvegeo', 'lat', 'lon']]
 coords_df['cvegeo'] = coords_df['cvegeo'].astype(str).str.zfill(5)
 
 muni_flows['source_code'] = muni_flows['source_code'].astype(str).str.zfill(5)
@@ -145,7 +177,7 @@ else:
 resid = np.asarray(ols.u).flatten()
 mi = Moran(resid, w)
 
-with open("ols_summary.txt", "w") as f:
+with open(HERE / "ols_summary.txt", "w", encoding="utf-8") as f:
     f.write(str(ols.summary))
 
 """from esda.moran import Moran
@@ -190,7 +222,9 @@ plt.savefig(
 plt.close()"""
 
 # --- Choropleth map using municipality polygons ---
-gdf = gpd.read_file('data/processed/municipios_harmonized_2020_shp/municipios_harmonized_2020.shp')
+gdf = gpd.read_file(
+    PROCESSED / "municipios_harmonized_2020_shp" / "municipios_harmonized_2020.shp"
+)
 gdf['cvegeo'] = gdf['cvegeo'].astype(str).str.zfill(5)
 
 map_df = gdf.merge(muni_data, on='cvegeo', how='left')
@@ -199,6 +233,12 @@ valid_map_df = map_df.dropna(subset=['flow']).reset_index(drop=True)
 w_map = KNN.from_dataframe(valid_map_df, k=5)
 w_map.transform = 'R'
 mi_flow = Moran(valid_map_df['flow'].values, w_map)
+
+# The headline spatial-autocorrelation figure. Printed as well as drawn on the
+# map, because it is a reported number and should not have to be read off a PNG.
+print(f"\n=== GLOBAL MORAN'S I, out-migration flows by source municipality ===")
+print(f"  I = {mi_flow.I:.4f}   p_sim = {mi_flow.p_sim:.4f}   "
+      f"n = {len(valid_map_df)} municipios")
 
 fig, ax = plt.subplots(figsize=(12, 12))
 
@@ -228,5 +268,5 @@ ax.set_title(
 )
 
 plt.tight_layout()
-plt.savefig("data/flow_map.png", dpi=300, bbox_inches='tight', facecolor='white')
+plt.savefig(HERE / "flow_map.png", dpi=300, bbox_inches='tight', facecolor='white')
 plt.close()
